@@ -1,0 +1,3142 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>ExcelDash Pro — Power BI Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
+<!-- firebase-config.js is a SEPARATE file (not in GitHub) containing your real API keys -->
+<!-- Create this file yourself and upload to GitHub — see Admin panel for instructions -->
+<script src="firebase-config.js" onerror="console.warn('firebase-config.js not found — Firebase disabled. See Admin panel.')"></script>
+<script>
+// ══ FIREBASE CONFIG ══
+// Keys are loaded from firebase-config.js (a separate file NOT in GitHub)
+// This keeps your API keys safe and off GitHub completely
+// See setup instructions in Admin → Users → Cross-Network Access panel
+const FB_CONFIG=window.FIREBASE_CONFIG||{
+  apiKey:"",
+  authDomain:"",
+  databaseURL:"https://exceldash-sis-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId:"",
+  storageBucket:"",
+  messagingSenderId:"",
+  appId:""
+};
+let fbReady=false,fbDB=null,fbRef=null,fbLastError=null;
+function initFirebase(){
+  try{
+    if(!FB_CONFIG.apiKey||FB_CONFIG.apiKey===''||FB_CONFIG.apiKey==='AIzaSyDEMO_REPLACE_WITH_YOUR_KEY'){
+      console.warn('ExcelDash: Firebase not configured — using localStorage only.');
+      return;
+    }
+    const app=firebase.initializeApp(FB_CONFIG);
+    fbDB=firebase.database(app);
+    fbRef=fbDB.ref('exceldash');
+
+    // Real connectivity test: try an actual read on our data path.
+    // This correctly surfaces auth errors, wrong databaseURL, and
+    // permission-denied (bad Database Rules) — unlike .info/connected
+    // which can silently stay false even when the DB is reachable.
+    const testTimeout=setTimeout(()=>{
+      fbReady=false;
+      fbLastError='TIMEOUT';
+      console.warn('ExcelDash: Firebase test read timed out (5s) — check internet or databaseURL.');
+    },5000);
+
+    fbRef.child('meta').once('value')
+      .then(()=>{
+        clearTimeout(testTimeout);
+        fbReady=true;
+        console.log('ExcelDash: Firebase connected ✓');
+        attachFbListener();
+      })
+      .catch(err=>{
+        clearTimeout(testTimeout);
+        fbReady=false;
+        if(err && err.code==='PERMISSION_DENIED'){
+          fbLastError='PERMISSION_DENIED';
+          console.error('ExcelDash: Firebase PERMISSION_DENIED — your Database Rules block read/write. Go to Firebase Console → Realtime Database → Rules and publish the rules shown in the Admin panel.');
+        } else {
+          fbLastError=(err && err.message) ? err.message : String(err);
+          console.error('ExcelDash: Firebase connection failed —', fbLastError);
+        }
+      });
+  }catch(e){
+    console.warn('ExcelDash: Firebase init failed, using localStorage.',e);
+    fbReady=false;
+    fbLastError=(e&&e.message)?e.message:String(e);
+  }
+}
+// Separated so the realtime listener only attaches AFTER we've confirmed
+// the connection actually works (avoids silent failures stacking up)
+function attachFbListener(){
+  if(!fbRef)return;
+  fbRef.child('meta').on('value',snap=>{
+    if(!S.user)return;
+    const d=snap.val();if(!d)return;
+    S.users=d.users||S.users;
+    S.pages=d.pages||S.pages;
+    S.chartCfg=d.chartCfg||S.chartCfg;
+    S.kpis=d.kpis||S.kpis;
+    S.slicerCols=d.slicerCols||S.slicerCols;
+    S.slicerMode=d.slicerMode||S.slicerMode;
+    const me=S.users.find(u=>u&&u.id===S.user?.id);
+    if(!me){console.warn('ExcelDash: current user id not found in synced data — keeping existing session to avoid wrongful logout.');return;}
+    if(!me.active){doLogout();return;}
+    S.user=me;
+    rebuildNav();updateStats();
+    if(S.currentPid){
+      const pid=S.currentPid;
+      const grid=document.getElementById('grid-'+pid);
+      if(grid){
+        Object.keys(S.charts).filter(cid=>S.chartCfg[cid]?.pid===pid)
+          .forEach(cid=>{S.charts[cid]?.destroy();delete S.charts[cid];});
+        grid.innerHTML='';
+        restorePageWidgets(pid);
+      }
+      const p=S.pages.find(x=>x.id===pid);
+      if(p){
+        const parsed=getParsed(pid,p.activeSheet||p.sheetNames?.[0]);
+        if(parsed){buildSlicers(pid,parsed);const fr=getFilteredRows(pid,parsed);renderKPIs(pid,parsed,fr);}
+      }
+    }
+    notify('Dashboard synced ✓','ok');
+  },err=>{
+    console.error('ExcelDash: Firebase listener error —',err && err.code);
+    fbReady=false;
+  });
+}
+function fbSave(data){
+  if(!fbReady||!fbRef)return Promise.resolve();
+  // Non-blocking save with timeout — never delays the UI
+  Promise.race([
+    fbRef.child('meta').set(data),
+    new Promise(res=>setTimeout(res,8000))
+  ]).catch(e=>console.warn('fbSave:',e));
+  return Promise.resolve();
+}
+function fbLoad(){
+  if(!fbReady||!fbRef)return Promise.resolve(null);
+  // Add 5s timeout — Firebase Asia region can be slow on first connect
+  return Promise.race([
+    fbRef.child('meta').once('value').then(s=>s.val()),
+    new Promise(res=>setTimeout(()=>res(null),5000))
+  ]).catch(()=>null);
+}
+</script>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<style>
+/* ====== TOKENS ====== */
+:root{
+  --bg:#f1f4fb;--surface:#fff;--s2:#f6f8fd;--border:#e3e8f0;--border2:#cdd4e3;
+  --primary:#5b5ef4;--pl:#eef0ff;--pd:#3d3fb8;
+  --text:#0d1117;--muted:#5a6175;--muted2:#9aa3b8;
+  --success:#16a34a;--sbg:#ecfdf5;
+  --danger:#e53e3e;--dbg:#fff5f5;
+  --warning:#d97706;--wbg:#fffbeb;
+  --info:#0284c7;--ibg:#e0f2fe;
+  --purple:#7c3aed;--pbg:#f3eeff;
+  --cyan:#06b6d4;--cbg:#ecfeff;
+  --sidebar:230px;--top:52px;
+  --r:8px;--rl:12px;--rxl:16px;
+  --sh:0 1px 4px rgba(0,0,0,.06),0 2px 8px rgba(0,0,0,.04);
+  --shm:0 4px 16px rgba(0,0,0,.09);
+  --shlg:0 8px 32px rgba(0,0,0,.12);
+  --font:'Plus Jakarta Sans',sans-serif;
+  --mono:'JetBrains Mono',monospace;
+  --trans:all .18s cubic-bezier(.4,0,.2,1);
+}
+[data-theme="dark"]{
+  --bg:#0d1117;--surface:#161b22;--s2:#1c2230;--border:#21293a;--border2:#2d3a50;
+  --primary:#6c6ff5;--pl:#1a1c3d;--pd:#8082f7;
+  --text:#e6edf3;--muted:#8b949e;--muted2:#3d4754;
+  --success:#3fb950;--sbg:#0d2818;
+  --danger:#f85149;--dbg:#2a0f0f;
+  --warning:#d29922;--wbg:#2a200a;
+  --info:#58a6ff;--ibg:#0c1f35;
+  --purple:#bc8cff;--pbg:#1e1235;
+  --cyan:#39c5cf;--cbg:#0a2027;
+  --sh:0 1px 4px rgba(0,0,0,.3),0 2px 8px rgba(0,0,0,.2);
+  --shm:0 4px 16px rgba(0,0,0,.4);
+  --shlg:0 8px 32px rgba(0,0,0,.5);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:13px;line-height:1.5;min-height:100vh;transition:background .25s,color .25s}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+
+/* ====== LOGIN ====== */
+.lscr{min-height:100vh;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden;
+  background:var(--bg);}
+.lscr-bg{position:absolute;inset:0;pointer-events:none;
+  background:radial-gradient(ellipse 70% 60% at 65% 40%,rgba(91,94,244,.13) 0%,transparent 70%),
+             radial-gradient(ellipse 50% 50% at 20% 80%,rgba(6,182,212,.08) 0%,transparent 60%);
+}
+.lscr-grid{position:absolute;inset:0;pointer-events:none;opacity:.35;
+  background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);
+  background-size:44px 44px;
+}
+.lcard{background:var(--surface);border:1px solid var(--border);border-radius:var(--rxl);padding:38px 34px;width:410px;box-shadow:var(--shlg);position:relative;z-index:1;animation:slideUp .5s ease}
+@keyframes slideUp{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:translateY(0)}}
+.llogo-row{display:flex;align-items:center;gap:10px;margin-bottom:22px}
+.llogo-ico{width:42px;height:42px;background:linear-gradient(135deg,var(--primary),var(--cyan));border-radius:11px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:20px;font-weight:800;flex-shrink:0}
+.llogo-name{font-size:20px;font-weight:800;letter-spacing:-.3px}
+.llogo-name span{color:var(--primary)}
+.ltitle{font-size:21px;font-weight:700;margin-bottom:3px}
+.lsub{font-size:12px;color:var(--muted);margin-bottom:24px}
+.lfield{margin-bottom:13px}
+.lfield label{display:block;font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;margin-bottom:4px}
+.lfield input{width:100%;padding:9px 12px;border:1.5px solid var(--border);border-radius:var(--r);font-size:13px;font-family:var(--font);background:var(--surface);color:var(--text);outline:none;transition:var(--trans)}
+.lfield input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(91,94,244,.12)}
+.lerr{color:var(--danger);font-size:11px;margin-top:5px;display:none;padding:7px 11px;background:var(--dbg);border-radius:var(--r)}
+.ldemo{margin-top:14px;padding:9px 12px;background:var(--s2);border-radius:var(--r);font-size:11px;color:var(--muted);line-height:1.9;text-align:center;border:1px solid var(--border)}
+.prog{height:2px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:11px;display:none}
+.pfill{height:100%;background:linear-gradient(90deg,var(--primary),var(--cyan));animation:pf 1.2s linear infinite}
+@keyframes pf{0%{width:0;margin-left:0}50%{width:60%;margin-left:20%}100%{width:0;margin-left:100%}}
+
+/* ====== BUTTONS ====== */
+.btn{display:inline-flex;align-items:center;gap:5px;padding:7px 14px;border-radius:var(--r);font-size:12px;font-weight:600;font-family:var(--font);cursor:pointer;border:none;transition:var(--trans);user-select:none;white-space:nowrap}
+.bp{background:var(--primary);color:#fff;box-shadow:0 2px 8px rgba(91,94,244,.28)}.bp:hover{background:var(--pd);transform:translateY(-1px)}
+.bo{background:var(--surface);color:var(--text);border:1.5px solid var(--border)}.bo:hover{background:var(--s2)}
+.bd{background:var(--dbg);color:var(--danger);border:1px solid rgba(229,62,62,.2)}.bd:hover{background:#ffe4e4}
+.bs{background:var(--sbg);color:var(--success)}
+.bgrad{background:linear-gradient(135deg,var(--primary),var(--cyan));color:#fff;box-shadow:0 2px 10px rgba(91,94,244,.3)}.bgrad:hover{opacity:.9;transform:translateY(-1px)}
+.bsm{padding:4px 9px;font-size:11px}
+.bxs{padding:3px 7px;font-size:10px}
+.bico{padding:5px;width:28px;height:28px;justify-content:center}
+
+/* ====== APP SHELL ====== */
+.app{display:flex;min-height:100vh}
+.sidebar{width:var(--sidebar);background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;position:fixed;top:0;left:0;height:100vh;z-index:100;transition:transform .3s ease,var(--trans)}
+.sblogo{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:9px;flex-shrink:0}
+.sb-ico{width:30px;height:30px;background:linear-gradient(135deg,var(--primary),var(--cyan));border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:14px;font-weight:800}
+.sb-name{font-size:13px;font-weight:800;letter-spacing:-.2px}
+.sb-name span{color:var(--primary)}
+.sbnav{flex:1;overflow-y:auto;padding:7px}
+.nsec{font-size:9px;font-weight:700;color:var(--muted2);text-transform:uppercase;letter-spacing:1px;padding:11px 8px 4px}
+.ni{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:var(--r);cursor:pointer;color:var(--muted);font-size:12px;font-weight:500;margin-bottom:1px;transition:var(--trans);user-select:none;position:relative}
+.ni:hover{background:var(--s2);color:var(--text)}
+.ni.active{background:var(--pl);color:var(--primary);font-weight:600}
+.ni.active::before{content:'';position:absolute;left:0;top:50%;transform:translateY(-50%);width:3px;height:55%;background:var(--primary);border-radius:0 3px 3px 0}
+.nico{font-size:14px;min-width:16px;text-align:center}
+.sbfoot{padding:10px;border-top:1px solid var(--border);flex-shrink:0}
+.ucard{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:var(--rl);cursor:pointer;transition:var(--trans)}
+.ucard:hover{background:var(--s2)}
+.av{width:29px;height:29px;border-radius:50%;background:linear-gradient(135deg,var(--primary),var(--cyan));color:#fff;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0}
+
+/* TOPBAR */
+.topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:0 16px;height:var(--top);display:flex;align-items:center;gap:8px;position:sticky;top:0;z-index:80;backdrop-filter:blur(8px)}
+.tbtitle{font-size:14px;font-weight:700;flex:1;letter-spacing:-.2px}
+.tbsub{font-size:10px;color:var(--muted);font-weight:400;margin-left:5px}
+/* theme toggle */
+.thm-btn{width:36px;height:20px;background:var(--border);border-radius:20px;cursor:pointer;position:relative;transition:var(--trans);border:none;flex-shrink:0}
+.thm-btn.on{background:var(--primary)}
+.thm-btn::after{content:'☀️';position:absolute;width:16px;height:16px;background:var(--surface);border-radius:50%;top:2px;left:2px;transition:var(--trans);box-shadow:0 1px 3px rgba(0,0,0,.2);display:flex;align-items:center;justify-content:center;font-size:9px;line-height:16px;text-align:center}
+.thm-btn.on::after{transform:translateX(16px);content:'🌙'}
+
+.main{margin-left:var(--sidebar);flex:1;display:flex;flex-direction:column;min-height:100vh}
+.content{padding:16px;flex:1}
+.page{display:none}.page.active{display:block}
+
+/* ====== HOME HERO ====== */
+.hero{border-radius:var(--rxl);padding:24px 26px;color:#fff;margin-bottom:14px;position:relative;overflow:hidden;
+  background:linear-gradient(135deg,var(--primary) 0%,#06b6d4 100%)}
+.hero::before,.hero::after{content:'';position:absolute;border-radius:50%;pointer-events:none}
+.hero::before{width:200px;height:200px;background:rgba(255,255,255,.07);top:-60px;right:-40px}
+.hero::after{width:120px;height:120px;background:rgba(255,255,255,.05);bottom:-40px;right:80px}
+.hero-title{font-size:21px;font-weight:800;margin-bottom:3px;letter-spacing:-.3px}
+.hero-sub{font-size:12px;opacity:.8;margin-bottom:14px}
+.hero-btns{display:flex;gap:8px;flex-wrap:wrap}
+.hbtn{display:inline-flex;align-items:center;gap:5px;padding:7px 14px;border-radius:var(--r);font-size:12px;font-weight:700;cursor:pointer;border:none;transition:var(--trans)}
+.hbtn-w{background:#fff;color:var(--primary)}.hbtn-w:hover{background:rgba(255,255,255,.9)}
+.hbtn-t{background:rgba(255,255,255,.15);color:#fff;border:1.5px solid rgba(255,255,255,.3)}.hbtn-t:hover{background:rgba(255,255,255,.25)}
+
+/* ====== KPI CARDS ====== */
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:11px;margin-bottom:14px}
+.kpi-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:13px 15px;box-shadow:var(--sh);position:relative;overflow:hidden;transition:var(--trans);cursor:default}
+.kpi-card:hover{transform:translateY(-1px);box-shadow:var(--shm)}
+.kpi-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;border-radius:var(--rl) var(--rl) 0 0}
+.kc-blue::before{background:linear-gradient(90deg,#3b82f6,#6366f1)}
+.kc-green::before{background:linear-gradient(90deg,#10b981,#06b6d4)}
+.kc-amber::before{background:linear-gradient(90deg,#f59e0b,#f97316)}
+.kc-red::before{background:linear-gradient(90deg,#ef4444,#f43f5e)}
+.kc-purple::before{background:linear-gradient(90deg,#8b5cf6,#a855f7)}
+.kc-cyan::before{background:linear-gradient(90deg,#06b6d4,#0284c7)}
+.kpi-lbl{font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.6px;margin-bottom:5px}
+.kpi-val{font-size:24px;font-weight:800;line-height:1;letter-spacing:-1px;margin-bottom:3px}
+.kpi-meta{font-size:10px;color:var(--muted)}
+.kpi-ico{position:absolute;right:13px;top:12px;font-size:22px;opacity:.15}
+.kpi-bar{height:3px;background:var(--border);border-radius:2px;margin-top:7px;overflow:hidden}
+.kpi-fill{height:100%;border-radius:2px;background:var(--primary);transition:width .4s ease}
+
+/* ====== DASHBOARD GRID ====== */
+.db-grid{display:flex;flex-wrap:wrap;gap:11px;padding:4px 0}
+.chart-widget{background:var(--surface);border:2px solid var(--border);border-radius:var(--rl);box-shadow:var(--sh);overflow:hidden;transition:var(--trans);position:relative;flex-shrink:0}
+.chart-widget:hover{box-shadow:var(--shm)}
+/* width presets */
+.w25{width:calc(25% - 9px)}.w33{width:calc(33.333% - 8px)}.w50{width:calc(50% - 6px)}.w66{width:calc(66.666% - 4px)}.w75{width:calc(75% - 3px)}.w100{width:100%}
+/* height presets */
+.hs{height:220px}.hm{height:300px}.hlg{height:380px}
+.chart-widget.edit-mode{border-color:var(--primary);cursor:move}
+.chart-widget.edit-mode .wdrag-handle{display:flex}
+.chart-widget.dragging{opacity:.55;box-shadow:var(--shlg)}
+/* Widget header */
+.whead{padding:10px 13px 7px;display:flex;align-items:center;gap:7px;border-bottom:1px solid var(--border)}
+.wqbar{display:flex;gap:3px;flex-wrap:wrap;padding:5px 10px;border-bottom:1px solid var(--border);background:var(--s2)}
+.wqbtn{font-size:10px;padding:3px 8px;border-radius:20px;cursor:pointer;border:1.5px solid var(--border);background:var(--surface);color:var(--muted);white-space:nowrap;transition:var(--trans)}
+.wqbtn:hover{border-color:var(--primary);color:var(--primary)}
+.wqbtn.on{background:var(--primary);color:#fff;border-color:var(--primary)}
+.wtitle{font-size:12px;font-weight:700;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+.wactions{display:flex;gap:3px;align-items:center;flex-shrink:0}
+.wdrag-handle{display:none;cursor:move;color:var(--muted);font-size:12px;padding:2px 4px;align-items:center}
+.wchart{padding:8px 12px 10px;overflow:hidden;position:relative}
+.wchart canvas{width:100%!important}
+/* Resize handle */
+.resize-se{position:absolute;bottom:0;right:0;width:16px;height:16px;cursor:se-resize;opacity:0;transition:opacity .2s;z-index:5}
+.resize-se::before{content:'';position:absolute;bottom:3px;right:3px;width:8px;height:8px;border-bottom:2px solid var(--primary);border-right:2px solid var(--primary)}
+.chart-widget:hover .resize-se,.chart-widget.edit-mode .resize-se{opacity:1}
+
+/* ====== SLICER ZONE ====== */
+.slicer-zone{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:11px 13px;margin-bottom:11px;box-shadow:var(--sh);position:relative}
+.slicer-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:6px}
+.slicer-title{font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.7px}
+.slicer-row{display:flex;gap:9px;flex-wrap:wrap;align-items:flex-start}
+.slicer-item{flex:1;min-width:130px;max-width:260px}
+.sl-lbl{font-size:10px;font-weight:700;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.4px}
+/* dropdown mode */
+.sl-select{width:100%;padding:5px 9px;border:1.5px solid var(--border);border-radius:var(--r);font-size:12px;font-family:var(--font);background:var(--surface);color:var(--text);cursor:pointer;outline:none;transition:var(--trans)}
+.sl-select:focus{border-color:var(--primary)}
+/* chip mode */
+.sl-chips{display:flex;flex-wrap:wrap;gap:3px;max-height:72px;overflow-y:auto}
+.chip{padding:3px 9px;border-radius:20px;font-size:11px;font-weight:500;cursor:pointer;border:1.5px solid var(--border);background:var(--surface);color:var(--muted);transition:var(--trans);user-select:none}
+.chip:hover{border-color:var(--primary);color:var(--primary)}
+.chip.on{background:var(--primary);color:#fff;border-color:var(--primary)}
+.chip.all{background:var(--pl);color:var(--primary);border-color:var(--primary)}
+
+/* ====== TABLE ====== */
+.tbl-outer{overflow:auto;max-height:230px;border:1px solid var(--border);border-radius:var(--r)}
+table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}
+th{text-align:left;padding:7px 9px;font-size:10px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.5px;border-bottom:2px solid var(--border);background:var(--s2);white-space:nowrap;position:sticky;top:0;z-index:2}
+td{padding:7px 9px;border-bottom:1px solid var(--border);vertical-align:middle;white-space:nowrap;color:var(--text)}
+tr:last-child td{border:none}
+tbody tr:hover td{background:var(--s2)}
+
+/* ====== MODALS ====== */
+.ov{position:fixed;inset:0;background:rgba(0,0,0,.48);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(3px)}
+.ov.open{display:flex}
+.modal{background:var(--surface);border-radius:var(--rxl);padding:22px;max-width:540px;width:92%;box-shadow:var(--shlg);max-height:90vh;overflow-y:auto;animation:mIn .22s ease}
+@keyframes mIn{from{opacity:0;transform:scale(.96)translateY(8px)}to{opacity:1;transform:scale(1)}}
+.modal-title{font-size:14px;font-weight:700;margin-bottom:14px;letter-spacing:-.2px}
+.mtabs{display:flex;border-bottom:2px solid var(--border);margin-bottom:13px}
+.mtab{padding:6px 13px;font-size:12px;font-weight:600;cursor:pointer;color:var(--muted);border-bottom:2px solid transparent;margin-bottom:-2px;transition:var(--trans)}
+.mtab.on{color:var(--primary);border-bottom-color:var(--primary)}
+.mtab-panel{display:none}.mtab-panel.on{display:block}
+
+/* ====== FIELD ====== */
+.fld{margin-bottom:11px}
+.fld label,.flbl{display:block;font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px}
+.finp{width:100%;padding:8px 11px;border:1.5px solid var(--border);border-radius:var(--r);font-size:12px;font-family:var(--font);background:var(--surface);color:var(--text);outline:none;transition:var(--trans)}
+.finp:focus{border-color:var(--primary)}
+select.finp{cursor:pointer}
+
+/* ====== NOTIFY TOAST ====== */
+.notify{position:fixed;top:13px;right:13px;background:var(--text);color:var(--surface);padding:9px 15px;border-radius:var(--rl);font-size:12px;font-weight:600;z-index:999;opacity:0;transform:translateY(-8px);transition:all .25s;pointer-events:none;box-shadow:var(--shlg)}
+.notify.show{opacity:1;transform:translateY(0)}
+.notify.ok{background:var(--success)}.notify.err{background:var(--danger)}.notify.info{background:var(--primary)}
+
+/* ====== BADGES ====== */
+.badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:20px;font-size:10px;font-weight:600}
+.bbl{background:var(--ibg);color:var(--info)}.bgr{background:var(--sbg);color:var(--success)}
+.bam{background:var(--wbg);color:var(--warning)}.brd{background:var(--dbg);color:var(--danger)}
+.bpu{background:var(--pbg);color:var(--purple)}.bgr2{background:var(--s2);color:var(--muted)}
+
+/* ====== UPLOAD ZONE ====== */
+.uz{border:2px dashed var(--border2);border-radius:var(--rl);padding:26px 18px;text-align:center;cursor:pointer;transition:var(--trans);background:var(--s2)}
+.uz:hover,.uz.drag{border-color:var(--primary);background:var(--pl)}
+.uz input{display:none}
+
+/* ====== TOOLBAR ====== */
+.toolbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:11px}
+.tsep{width:1px;height:20px;background:var(--border);flex-shrink:0}
+
+/* ====== CHART STYLE PANEL ====== */
+.cs-panel{background:var(--s2);border:1px solid var(--border);border-radius:var(--r);padding:10px;display:none}
+.cs-panel.open{display:block}
+.cs-section{margin-bottom:10px}
+.cs-label{font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px}
+.pal-row{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+.pal-dot{width:20px;height:20px;border-radius:50%;cursor:pointer;border:2px solid transparent;transition:var(--trans);flex-shrink:0}
+.pal-dot:hover,.pal-dot.on{border-color:var(--text);transform:scale(1.15)}
+
+/* ====== BUILDER PAGE ====== */
+.builder-layout{display:grid;grid-template-columns:270px 1fr;gap:14px;min-height:calc(100vh - 110px)}
+.builder-panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:14px;box-shadow:var(--sh);height:fit-content;position:sticky;top:70px}
+.bsec{margin-bottom:11px}
+.bsec-title{font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:5px}
+.bbtn-row{display:flex;gap:4px;flex-wrap:wrap}
+.bb{padding:4px 9px;border-radius:5px;font-size:11px;font-weight:600;cursor:pointer;border:1.5px solid var(--border);background:var(--surface);color:var(--muted);transition:var(--trans)}
+.bb:hover{border-color:var(--primary);color:var(--primary)}
+.bb.on{background:var(--pl);color:var(--primary);border-color:var(--primary)}
+
+/* ====== FILTER PANE ====== */
+.fp{position:fixed;right:0;top:0;height:100vh;width:260px;background:var(--surface);border-left:1px solid var(--border);z-index:150;transform:translateX(100%);transition:transform .28s ease;display:flex;flex-direction:column;box-shadow:var(--shlg)}
+.fp.open{transform:translateX(0)}
+.fp-head{padding:14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.fp-body{flex:1;overflow-y:auto;padding:13px}
+
+/* ====== MISC ====== */
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:11px}
+.g4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:14px;box-shadow:var(--sh)}
+.ch{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;gap:7px}
+.ct{font-size:13px;font-weight:700}
+.row{display:flex;gap:9px;align-items:center}
+.divider{height:1px;background:var(--border);margin:10px 0}
+.spin{width:13px;height:13px;border:2px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:sp .6s linear infinite;display:inline-block}
+@keyframes sp{to{transform:rotate(360deg)}}
+.empty{text-align:center;padding:28px 16px;color:var(--muted)}
+.pli-item{display:flex;align-items:center;gap:8px;padding:9px 0;border-bottom:1px solid var(--border);cursor:pointer}
+.pli-item:last-child{border:none}
+.pli-item:hover{background:var(--s2);margin:0 -4px;padding:9px 4px;border-radius:var(--r)}
+
+/* ====== AUDIT ====== */
+.arow{display:flex;align-items:flex-start;gap:9px;padding:7px 0;border-bottom:1px solid var(--border)}
+.arow:last-child{border:none}
+.adot{width:7px;height:7px;border-radius:50%;flex-shrink:0;margin-top:4px}
+.adot.create{background:var(--success)}.adot.update{background:var(--warning)}.adot.delete{background:var(--danger)}.adot.login{background:var(--primary)}
+
+/* ====== RESPONSIVE ====== */
+@media(max-width:1100px){.w25{width:calc(50% - 6px)}.w33{width:calc(50% - 6px)}.builder-layout{grid-template-columns:1fr}}
+@media(max-width:760px){
+  :root{--sidebar:0px}
+  .sidebar{transform:translateX(-230px);width:230px}
+  .sidebar.mob-open{transform:translateX(0)}
+  .main{margin-left:0}
+  .w25,.w33,.w50,.w66,.w75{width:100%}
+  .kpi-grid{grid-template-columns:1fr 1fr}
+  .g2,.g3,.g4{grid-template-columns:1fr}
+  .content{padding:11px}
+  .builder-layout{grid-template-columns:1fr}
+  #mobBtn{display:flex!important}
+}
+#mobBtn{display:none;width:32px;height:32px;align-items:center;justify-content:center;background:var(--s2);border:1px solid var(--border);border-radius:var(--r);cursor:pointer;font-size:15px;flex-shrink:0}
+</style>
+</head>
+<body>
+<!-- LOGIN -->
+<div id="loginPage" class="lscr">
+  <div class="lscr-bg"></div><div class="lscr-grid"></div>
+  <div class="lcard">
+    <div class="llogo-row"><div class="llogo-ico">D</div><div class="llogo-name">Excel<span>Dash</span> Pro</div></div>
+    <div class="ltitle">Welcome back</div>
+    <div class="lsub">Power BI Style Dashboard Platform</div>
+    <div class="lfield"><label>Email</label><input id="lemail" type="email" placeholder="admin@demo.com" autofocus/></div>
+    <div class="lfield"><label>Password</label><input id="lpass" type="password" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()"/></div>
+    <div class="lerr" id="lerr">❌ Invalid credentials. Try again.</div>
+    <button class="btn bgrad" id="loginSignInBtn" style="width:100%;justify-content:center;padding:10px;margin-top:5px" onclick="doLogin()">Sign In →</button>
+    <div class="prog" id="lprog"><div class="pfill"></div></div>
+    <div class="ldemo"><b style="color:var(--text)">Admin:</b> admin@demo.com / admin123 &nbsp;|&nbsp; <b style="color:var(--text)">User:</b> user@demo.com / user123</div>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="appWrap" class="app" style="display:none">
+  <aside class="sidebar" id="sidebar">
+    <div class="sblogo">
+      <div class="sb-ico">D</div>
+      <div class="sb-name">Excel<span>Dash</span></div>
+    </div>
+    <nav class="sbnav">
+      <div class="nsec">Overview</div>
+      <div class="ni active" onclick="gotoPage('home',this)"><span class="nico">🏠</span>Home</div>
+      <div class="nsec">Data Pages</div>
+      <div id="dynNav"></div>
+      <div class="ni" id="navAddPage" onclick="gotoPage('addPage',this)"><span class="nico">➕</span>Add New Page</div>
+      <div id="adminNavWrap" style="display:none">
+        <div class="nsec">Admin</div>
+        <div class="ni" onclick="gotoPage('adminUsers',this)"><span class="nico">👥</span>Manage Users</div>
+        <div class="ni" onclick="gotoPage('auditLog',this)"><span class="nico">📋</span>Audit Log</div>
+      </div>
+      <div class="nsec">Tools</div>
+      <div class="ni" id="navBuilder" onclick="gotoPage('chartBuilder',this)"><span class="nico">🔧</span>Chart Builder</div>
+    </nav>
+    <div class="sbfoot">
+      <div class="ucard" onclick="logout()">
+        <div class="av" id="sbAv">U</div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:12px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" id="sbName">User</div>
+          <div style="font-size:10px;color:var(--muted)" id="sbRole">Member</div>
+        </div>
+        <span style="font-size:12px;color:var(--muted)">⬅</span>
+      </div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <div class="topbar">
+      <div id="mobBtn" onclick="document.getElementById('sidebar').classList.toggle('mob-open')">☰</div>
+      <div class="tbtitle" id="tbTitle">Home <span class="tbsub" id="tbSub"></span></div>
+      <span style="font-size:10px;color:var(--muted)" id="lastRef"></span>
+      <button class="btn bo bsm" onclick="manualRefresh()">🔄</button>
+      <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer">
+        <input type="checkbox" id="autoTgl" onchange="toggleAuto()" style="accent-color:var(--primary)"/> Auto
+      </label>
+      <button class="btn bo bsm" id="filterPaneBtn" onclick="toggleFP()">⚗ Filter</button>
+      <button class="btn bo bsm" id="btnExPDF" onclick="exportPDF()">📄 PDF</button>
+      <button class="btn bo bsm" id="btnExXL" onclick="exportExcel()">📊 Excel</button>
+      <button class="btn bo bsm" onclick="toggleFS()">⛶</button>
+      <button class="thm-btn" id="thmBtn" onclick="toggleTheme()" title="Day/Night"></button>
+    </div>
+    <div class="content">
+      <!-- HOME -->
+      <div class="page active" id="page-home">
+        <div class="hero">
+          <div class="hero-title" id="heroTitle">Hello 👋</div>
+          <div class="hero-sub" id="heroDate"></div>
+          <div class="hero-btns">
+            <button class="hbtn hbtn-w" id="heroAddBtn" onclick="gotoPage('addPage')">+ Add Data Page</button>
+            <button class="hbtn hbtn-t" onclick="gotoPage('chartBuilder')">🔧 Chart Builder</button>
+          </div>
+        </div>
+        <div class="kpi-grid" id="homeKpiGrid">
+          <div class="kpi-card kc-blue"><div class="kpi-ico">📄</div><div class="kpi-lbl">Pages</div><div class="kpi-val" id="kvPg">0</div><div class="kpi-meta" id="kmPg">—</div><div class="kpi-bar"><div class="kpi-fill" id="kfPg" style="width:0%"></div></div></div>
+          <div class="kpi-card kc-green" id="homeKpiFiles"><div class="kpi-ico">📁</div><div class="kpi-lbl">Files Loaded</div><div class="kpi-val" id="kvFl">0</div><div class="kpi-meta">Excel files</div><div class="kpi-bar"><div class="kpi-fill kc-green" id="kfFl" style="width:0%"></div></div></div>
+          <div class="kpi-card kc-amber" id="homeKpiCharts"><div class="kpi-ico">📊</div><div class="kpi-lbl">Charts</div><div class="kpi-val" id="kvCh">0</div><div class="kpi-meta">Built</div><div class="kpi-bar"><div class="kpi-fill kc-amber" id="kfCh" style="width:0%"></div></div></div>
+          <div class="kpi-card kc-purple" id="homeKpiUsers"><div class="kpi-ico">👥</div><div class="kpi-lbl">Users</div><div class="kpi-val" id="kvUs">1</div><div class="kpi-meta" id="kmUs">—</div><div class="kpi-bar"><div class="kpi-fill kc-purple" id="kfUs" style="width:0%"></div></div></div>
+        </div>
+        <div class="g2">
+          <div class="card">
+            <div class="ch"><div class="ct">📊 Your Pages</div><button class="btn bp bsm" id="homePgAddBtn" onclick="gotoPage('addPage')">+ Add</button></div>
+            <div id="homePgList"><div class="empty">No pages yet</div></div>
+          </div>
+          <div class="card">
+            <div class="ct" style="margin-bottom:10px">📌 Quick Guide</div>
+            <div style="font-size:12px;color:var(--muted);line-height:2.1">
+              <div>1️⃣ <b style="color:var(--text)">Add Page</b> → Upload Excel (.xlsx/.csv)</div>
+              <div>2️⃣ <b style="color:var(--text)">Configure Slicers</b> — Admin picks columns</div>
+              <div>3️⃣ <b style="color:var(--text)">Chart Builder</b> → Select columns → Build</div>
+              <div>4️⃣ <b style="color:var(--text)">Edit Mode</b> → Drag &amp; resize charts</div>
+              <div>5️⃣ <b style="color:var(--text)">⚙ Chart Settings</b> → Colors, labels, size</div>
+            </div>
+            <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)">
+              <div style="font-size:11px;font-weight:700;margin-bottom:5px;color:var(--primary)">📲 Need access on another PC?</div>
+              <div style="font-size:11px;color:var(--muted)">Ask your Admin to set up <b>Firebase</b> (free) — then your login works on any device, any city, automatically. No file transfer needed.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ADD PAGE -->
+      <div class="page" id="page-addPage">
+        <div style="font-size:16px;font-weight:700;margin-bottom:3px">Add New Data Page</div>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:14px">Upload Excel/CSV — data is stored and persists after refresh</div>
+        <div style="max-width:560px">
+          <div class="card" style="margin-bottom:11px">
+            <div class="fld"><label>Page Name *</label><input class="finp" id="npName" placeholder="e.g. Monthly Resource Allocation"/></div>
+            <div class="g2">
+              <div class="fld"><label>Icon</label><select class="finp" id="npIcon"><option>📊</option><option>📈</option><option>📉</option><option>💰</option><option>👥</option><option>📦</option><option>🏭</option><option>🗂️</option><option>📋</option><option>🎯</option></select></div>
+              <div class="fld"><label>Default Cols</label><select class="finp" id="npCols"><option value="2">2 per row</option><option value="3">3 per row</option><option value="4">4 per row</option></select></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="ct" style="margin-bottom:9px">📁 Upload File</div>
+            <div class="uz" id="uploadZone" onclick="document.getElementById('fileInput').click()" ondragover="event.preventDefault();this.classList.add('drag')" ondragleave="this.classList.remove('drag')" ondrop="handleDrop(event)">
+              <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" onchange="handleFile(event)"/>
+              <div style="font-size:28px;margin-bottom:7px">📂</div>
+              <div style="font-size:13px;font-weight:700;margin-bottom:2px">Click or drag & drop</div>
+              <div style="font-size:11px;color:var(--muted)">.xlsx · .xls · .csv — stored in browser</div>
+            </div>
+            <div id="fileStatus" style="margin-top:8px;font-size:12px;color:var(--muted)"></div>
+            <div id="sheetSel" style="display:none;margin-top:10px">
+              <div class="fld"><label>Active Sheet</label><select class="finp" id="sheetSelect" onchange="previewSheet()"></select></div>
+            </div>
+            <div id="previewArea" style="margin-top:9px"></div>
+          </div>
+          <div class="row" style="margin-top:11px">
+            <button class="btn bp" onclick="addPage()">➕ Create Page</button>
+            <button class="btn bo" onclick="gotoPage('home')">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- CHART BUILDER -->
+      <div class="page" id="page-chartBuilder">
+        <div style="font-size:16px;font-weight:700;margin-bottom:3px">🔧 Chart Builder</div>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:14px">Build Power BI style charts from your Excel data</div>
+        <div class="builder-layout">
+          <div class="builder-panel">
+            <div class="bsec">
+              <div class="bsec-title">Data Source</div>
+              <div class="fld"><label>Page</label><select class="finp" id="cbPage" onchange="cbLoadPage()"><option value="">-- Select --</option></select></div>
+              <div class="fld"><label>Sheet</label><select class="finp" id="cbSheet" onchange="cbLoadSheet()"></select></div>
+            </div>
+            <div class="divider"></div>
+            <div class="bsec">
+              <div class="bsec-title">Chart Type</div>
+              <div class="bbtn-row" id="cbTypeRow"></div>
+            </div>
+            <div class="divider"></div>
+            <div class="bsec">
+              <div class="bsec-title">Group By (X Axis) — Ctrl+click multi-select</div>
+              <select class="finp" id="cbX" multiple size="3" style="margin-top:2px"></select>
+            </div>
+            <div class="bsec">
+              <div class="bsec-title">Values (Y Axis) — Ctrl+click multi</div>
+              <select class="finp" id="cbY" multiple size="4" style="margin-top:2px" onchange="cbYChanged()"></select>
+            </div>
+            <div class="bsec" id="cbComboWrap" style="display:none">
+              <div class="bsec-title">Combo — Per Series Settings</div>
+              <div id="cbComboSeries" style="display:flex;flex-direction:column;gap:6px"></div>
+            </div>
+            <div class="divider"></div>
+            <div class="bsec">
+              <div class="bsec-title">Aggregation</div>
+              <div class="bbtn-row" id="cbAggRow"></div>
+            </div>
+            <div class="bsec">
+              <div class="bsec-title">Sort</div>
+              <div class="bbtn-row" id="cbSortRow"></div>
+            </div>
+            <div class="bsec" id="cbGTWrap">
+              <div class="bsec-title">Grand Total Column</div>
+              <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer"><input type="checkbox" id="cbGrandTotal" style="accent-color:var(--primary)"/> Show Grand Total bar/slice</label>
+            </div>
+            <div class="divider"></div>
+            <div class="bsec">
+              <div class="bsec-title">Data Labels Decimal</div>
+              <div class="bbtn-row" id="cbDecRow"></div>
+            </div>
+            <div class="bsec" id="cbPieLblWrap" style="display:none">
+              <div class="bsec-title">Pie / Doughnut Labels Show</div>
+              <div style="display:flex;gap:10px;flex-wrap:wrap">
+                <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer"><input type="checkbox" id="cbPieName" checked style="accent-color:var(--primary)"/> Category Name</label>
+                <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer"><input type="checkbox" id="cbPiePct" checked style="accent-color:var(--primary)"/> %</label>
+                <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer"><input type="checkbox" id="cbPieVal" style="accent-color:var(--primary)"/> Value</label>
+              </div>
+              <div style="font-size:10px;color:var(--muted);margin-top:5px">Pie/Doughnut: per-category colors are always applied.</div>
+            </div>
+            <div class="bsec">
+              <div class="bsec-title">Show Data Labels</div>
+              <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer"><input type="checkbox" id="cbShowLabels" checked style="accent-color:var(--primary)"/> Show on chart</label>
+            </div>
+            <div class="bsec">
+              <div class="bsec-title">Line Style (Line / Combo / Area)</div>
+              <div class="bbtn-row" id="cbLineStyleRow"></div>
+            </div>
+            <div class="divider"></div>
+            <div class="bsec">
+              <div class="bsec-title">Axis Options</div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer"><input type="checkbox" id="cbShowX" checked style="accent-color:var(--primary)"/> X Axis</label>
+                <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer"><input type="checkbox" id="cbShowY" checked style="accent-color:var(--primary)"/> Y Axis</label>
+                <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer"><input type="checkbox" id="cbBoldAxis" style="accent-color:var(--primary)"/> Bold</label>
+              </div>
+            </div>
+            <div class="bsec">
+              <div class="bsec-title">Bar Width %</div>
+              <input type="range" id="cbBarW" min="20" max="100" value="70" style="width:100%" oninput="document.getElementById('cbBarWVal').textContent=this.value+'%'"/>
+              <span id="cbBarWVal" style="font-size:10px;color:var(--muted)">70%</span>
+            </div>
+            <div class="bsec">
+              <div class="bsec-title">Chart Filter Strip</div>
+              <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer"><input type="checkbox" id="cbShowFilter" checked style="accent-color:var(--primary)"/> Show category filter chips on widget</label>
+            </div>
+            <div class="divider"></div>
+            <div class="bsec">
+              <div class="bsec-title">Widget Width</div>
+              <div class="bbtn-row" id="cbWidthRow"></div>
+            </div>
+            <div class="bsec">
+              <div class="bsec-title">Widget Height</div>
+              <div class="bbtn-row" id="cbHeightRow"></div>
+            </div>
+            <div class="divider"></div>
+            <div class="bsec">
+              <div class="bsec-title">Widget Controls Visible to Users</div>
+              <div style="display:flex;flex-direction:column;gap:5px">
+                <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer"><input type="checkbox" id="cbAllowSettings" checked style="accent-color:var(--primary)"/> Allow opening ⚙ Chart Settings (admin always can)</label>
+                <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer"><input type="checkbox" id="cbAllowFilter" checked style="accent-color:var(--primary)"/> Allow chart filter strip interaction</label>
+              </div>
+            </div>
+            <div class="divider"></div>
+            <div class="fld"><label>Chart Title</label><input class="finp" id="cbTitle" placeholder="Auto generated"/></div>
+            <button class="btn bgrad" style="width:100%;justify-content:center;margin-bottom:6px" onclick="buildChart()">📊 Build & Add to Dashboard</button>
+            <button class="btn bo" style="width:100%;justify-content:center" onclick="previewChart()">👁 Preview Only</button>
+          </div>
+          <div>
+            <div class="card" id="cbPreviewCard" style="display:none;margin-bottom:11px">
+              <div class="ch"><div class="ct" id="cbPrevTitle">Preview</div></div>
+              <div style="height:300px;position:relative"><canvas id="cbCanvas"></canvas></div>
+            </div>
+            <div class="card">
+              <div class="ch"><div class="ct">📋 Data Preview</div><div style="font-size:10px;color:var(--muted)" id="cbDataInfo"></div></div>
+              <div id="cbDataTable"><div class="empty">Select page & sheet</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ADMIN USERS -->
+      <div class="page" id="page-adminUsers">
+        <div style="font-size:16px;font-weight:700;margin-bottom:3px">Manage Users</div>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:13px">Control access, roles, columns & slicer config</div>
+        <div style="margin-bottom:11px"><button class="btn bp bsm" onclick="openAddUser()">+ Add User</button></div>
+        <div class="card"><div class="tbl-outer" style="max-height:none"><table>
+          <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Pages</th><th>Status</th><th>Actions</th></tr></thead>
+          <tbody id="usersTbl"></tbody>
+        </table></div></div>
+
+        <!-- Cross-Network Access Panel -->
+        <div class="card" style="margin-top:16px">
+          <div style="font-size:14px;font-weight:700;margin-bottom:6px">🌐 Cross-Network Access (Any City, Any Device)</div>
+          <div id="fbStatusBanner" style="padding:8px 12px;border-radius:var(--r);margin-bottom:12px;font-size:11px;font-weight:600;background:#fef3c7;border:1px solid #fcd34d;color:#92400e">🟡 Checking Firebase…</div>
+          <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:var(--r);padding:12px;margin-bottom:12px">
+            <div style="font-size:12px;font-weight:700;color:#15803d;margin-bottom:6px">🔥 Enable Firebase — Free, One-Time Setup</div>
+            <div style="font-size:11px;color:#166534;margin-bottom:7px">Allows <b>any employee to login from any city, any laptop, any network</b> — data syncs automatically.</div>
+            <ol style="font-size:11px;color:#166534;margin:0 0 0 14px;line-height:2.3">
+              <li>Go to <b>console.firebase.google.com</b> → Create free project</li>
+              <li>Realtime Database → Create → Test mode</li>
+              <li>Project Settings → Your apps → Web → Copy config</li>
+              <li>Create a file called <code>firebase-config.js</code> (see instructions below) → upload separately</li>
+              <li>Save → Share updated HTML to all employees → Done ✓</li>
+            </ol>
+            <div style="margin-top:8px;font-size:10px;color:#15803d;background:#dcfce7;padding:6px 9px;border-radius:6px">
+  💡 Excel sheet data stays local per device. Users, pages, charts, KPIs, slicers sync via Firebase in real time.
+</div>
+<div style="margin-top:10px;background:#fff7ed;border:2px solid #fb923c;border-radius:var(--r);padding:11px 13px">
+  <div style="font-size:12px;font-weight:700;color:#c2410c;margin-bottom:7px">🔐 Secure Setup — Create firebase-config.js</div>
+  <div style="font-size:11px;color:#7c2d12;line-height:2.2">
+    <b>1.</b> Create a new file on your computer named <code style="background:#fee2e2;padding:1px 5px;border-radius:3px;font-size:10px">firebase-config.js</code><br>
+    <b>2.</b> Open it in Notepad and paste this — with YOUR real values:<br>
+  </div>
+  <pre style="background:#1e293b;color:#e2e8f0;padding:10px 12px;border-radius:6px;font-size:10px;margin:7px 0;overflow-x:auto;white-space:pre-wrap">window.FIREBASE_CONFIG = {
+  apiKey: "AIzaSy...your real key...",
+  authDomain: "exceldash-sis.firebaseapp.com",
+  databaseURL: "https://exceldash-sis-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "exceldash-sis",
+  storageBucket: "exceldash-sis.appspot.com",
+  messagingSenderId: "123456789",
+  appId: "1:123456789:web:abcdef"
+};</pre>
+  <div style="font-size:11px;color:#7c2d12;line-height:2.2">
+    <b>3.</b> Upload <code style="background:#fee2e2;padding:1px 5px;border-radius:3px;font-size:10px">firebase-config.js</code> to your GitHub repo (same folder as index.html)<br>
+    <b>4.</b> Add a <code style="background:#fee2e2;padding:1px 5px;border-radius:3px;font-size:10px">.gitignore</code> file in your repo containing just: <code style="background:#fee2e2;padding:1px 5px;border-radius:3px;font-size:10px">firebase-config.js</code><br>
+    <b>5.</b> Reload the page — green banner will appear ✓
+  </div>
+</div>
+          </div>
+          <div style="font-size:12px;font-weight:700;margin-bottom:5px">📁 Manual Backup (without Firebase)</div>
+          <div style="font-size:11px;color:var(--muted);margin-bottom:8px">Export → send file → user imports on their device.</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+            <button class="btn bp bsm" onclick="exportDashboard()">⬇ Export Dashboard JSON</button>
+            <label class="btn bo bsm" style="cursor:pointer">📁 Import Dashboard JSON<input type="file" accept=".json" style="display:none" onchange="importDashboard(event)"/></label>
+          </div>
+          <div style="font-size:10px;color:var(--muted)">Last exported: <span id="lastExportTime">Never</span></div>
+        </div>
+      </div>
+
+          <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:var(--r);padding:10px 12px;margin-bottom:10px">
+            <div style="font-size:12px;font-weight:700;color:#1d4ed8;margin-bottom:6px">📋 Step-by-step for any PC / Laptop</div>
+            <ol style="font-size:11px;color:#1e40af;margin:0 0 0 14px;line-height:2.1">
+              <li><b>Admin</b> clicks <b>"Export Dashboard JSON"</b> below — saves a .json file.</li>
+              <li>Send that file to the user (WhatsApp, email, USB, Google Drive — any way).</li>
+              <li><b>User</b> opens this same HTML file in their browser on their PC/laptop.</li>
+              <li>User logs in with their email &amp; password.</li>
+              <li>User clicks <b>"Import Dashboard JSON"</b> and picks the file admin sent.</li>
+              <li>All their permitted pages, charts, KPIs appear immediately ✓</li>
+            </ol>
+            <div style="font-size:10px;color:#dc2626;margin-top:7px">⚠ Import replaces all local data. Users should import only files received from admin.</div>
+          </div>
+
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+            <button class="btn bp bsm" onclick="exportDashboard()">⬇ Export Dashboard JSON</button>
+            <label class="btn bo bsm" style="cursor:pointer">📁 Import Dashboard JSON
+              <input type="file" accept=".json" style="display:none" onchange="importDashboard(event)"/>
+            </label>
+          </div>
+          <div style="font-size:10px;color:var(--muted)">Last exported: <span id="lastExportTime">Never</span></div>
+        </div>
+      </div>
+
+      <!-- AUDIT LOG -->
+      <div class="page" id="page-auditLog">
+        <div style="font-size:16px;font-weight:700;margin-bottom:13px">📋 Audit Log</div>
+        <div class="card"><div id="auditList"><div class="empty">No activity yet</div></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- FILTER PANE -->
+  <div class="fp" id="filterPane">
+    <div class="fp-head"><div style="font-size:13px;font-weight:700">⚗ Filters</div><button class="btn bo bsm" onclick="toggleFP()">✕</button></div>
+    <div class="fp-body" id="fpBody"><div style="font-size:12px;color:var(--muted)">Open a page to see filters</div></div>
+  </div>
+</div>
+
+<!-- MODALS -->
+<!-- Add User -->
+<div class="ov" id="addUserModal">
+  <div class="modal">
+    <div class="modal-title">➕ Add New User</div>
+    <div class="fld"><label>Full Name</label><input class="finp" id="nuName" placeholder="Jane Doe"/></div>
+    <div class="fld"><label>Email</label><input class="finp" id="nuEmail" type="email" placeholder="jane@company.com"/></div>
+    <div class="fld"><label>Password</label><input class="finp" id="nuPass" type="password"/></div>
+    <div class="fld"><label>Role</label><select class="finp" id="nuRole"><option value="user">User</option><option value="admin">Admin</option></select></div>
+    <div class="row" style="margin-top:10px"><button class="btn bp" onclick="createUser()">Create</button><button class="btn bo" onclick="closeModal('addUserModal')">Cancel</button></div>
+  </div>
+</div>
+
+<!-- Edit User Modal (Point 16) -->
+<div class="ov" id="editUserModal">
+  <div class="modal">
+    <div class="modal-title">✏ Edit User</div>
+    <div class="fld"><label>Full Name</label><input class="finp" id="euName"/></div>
+    <div class="fld"><label>Email / Login ID</label><input class="finp" id="euEmail" type="email"/></div>
+    <div class="fld"><label>New Password <span style="font-weight:400;color:var(--muted)">(leave blank to keep current)</span></label><input class="finp" id="euPass" type="password" placeholder="Enter new password to change"/></div>
+    <div class="fld"><label>Role</label><select class="finp" id="euRole"><option value="user">User</option><option value="admin">Admin</option></select></div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn bp" onclick="saveEditUser()">Save Changes</button>
+      <button class="btn bo" onclick="closeModal('editUserModal')">Cancel</button>
+    </div>
+  </div>
+</div>
+
+
+<!-- Access Modal -->
+<div class="ov" id="accessModal">
+  <div class="modal" style="max-width:600px">
+    <div class="modal-title" id="accessModalTitle">Access Settings</div>
+    <div class="mtabs">
+      <div class="mtab on" onclick="showMTab(0,this)">📄 Pages</div>
+      <div class="mtab" onclick="showMTab(1,this)">🔑 Role</div>
+      <div class="mtab" onclick="showMTab(2,this)">🔒 Columns</div>
+      <div class="mtab" onclick="showMTab(3,this)">⚙ Slicers</div>
+    </div>
+    <div class="mtab-panel on" id="mtab-0"><div id="pgAccList"></div></div>
+    <div class="mtab-panel" id="mtab-1">
+      <div class="fld"><label>Role</label><select class="finp" id="accRole"><option value="user">User — view pages only</option><option value="admin">Admin — full access</option></select></div>
+      <div style="background:var(--s2);border-radius:var(--r);padding:10px;font-size:11px;color:var(--muted);line-height:1.9;border:1px solid var(--border)"><b style="color:var(--text)">User:</b> View assigned pages, see saved charts, no add/delete, no admin panel<br><b style="color:var(--text)">Admin:</b> Full access — manage users, pages, charts, slicers, column access</div>
+    </div>
+    <div class="mtab-panel" id="mtab-2"><div id="colAccList"></div></div>
+    <div class="mtab-panel" id="mtab-3"><div style="font-size:11px;color:var(--muted);margin-bottom:9px">Select which columns appear as slicers for each page</div><div id="slicerCfgList"></div></div>
+    <div class="row" style="margin-top:14px"><button class="btn bp" onclick="saveAccess()">Save</button><button class="btn bo" onclick="closeModal('accessModal')">Cancel</button></div>
+  </div>
+</div>
+
+<!-- KPI Modal -->
+<div class="ov" id="kpiModal">
+  <div class="modal">
+    <div class="modal-title">📊 Add KPI Card</div>
+    <div class="fld"><label>Label</label><input class="finp" id="kpiLabel" placeholder="e.g. Total Billable"/></div>
+    <div class="fld"><label>Column</label><select class="finp" id="kpiCol"></select></div>
+    <div class="fld"><label>Aggregation</label><select class="finp" id="kpiAgg"><option value="sum">Sum</option><option value="count">Count</option><option value="avg">Average</option><option value="min">Min</option><option value="max">Max</option><option value="countd">Count Distinct</option></select></div>
+    <div class="g2">
+      <div class="fld"><label>Decimal Places</label><select class="finp" id="kpiDec"><option value="-1">Auto</option><option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option></select></div>
+      <div class="fld"><label>Show Subtitle</label><select class="finp" id="kpiShowMeta"><option value="none" selected>None</option><option value="agg">Show aggregation type</option><option value="pct">Show % of total</option><option value="both">Show both</option></select></div>
+    </div>
+    <div class="g2">
+      <div class="fld"><label>Color</label><select class="finp" id="kpiColor"><option value="kc-blue">Blue</option><option value="kc-green">Green</option><option value="kc-amber">Amber</option><option value="kc-red">Red</option><option value="kc-purple">Purple</option><option value="kc-cyan">Cyan</option></select></div>
+      <div class="fld"><label>Icon</label><input class="finp" id="kpiIcon" placeholder="📊"/></div>
+    </div>
+    <div class="row" style="margin-top:9px"><button class="btn bp" onclick="addKPI()">Add KPI</button><button class="btn bo" onclick="closeModal('kpiModal')">Cancel</button></div>
+  </div>
+</div>
+
+<!-- Chart Style Modal -->
+<div class="ov" id="csModal">
+  <div class="modal" style="max-width:460px">
+    <div class="modal-title">🎨 Chart Settings</div>
+    <div class="fld"><label>Chart Title <span style="color:var(--muted);font-weight:400">(Admin only edits)</span></label><input class="finp" id="csTitleInp"/></div>
+    <div class="divider"></div>
+    <div class="cs-section">
+      <div class="cs-label">Chart Type</div>
+      <select class="finp" id="csTypeSel" onchange="applyChartType(this.value)">
+        <option value="Column 2D">Column 2D</option>
+        <option value="Column 3D">Column 3D</option>
+        <option value="Bar 2D">Bar 2D</option>
+        <option value="Bar 3D">Bar 3D</option>
+        <option value="Line">Line</option>
+        <option value="Area">Area</option>
+        <option value="Pie 2D">Pie 2D</option>
+        <option value="Pie 3D">Pie 3D</option>
+        <option value="Doughnut">Doughnut</option>
+        <option value="Pie of Pie">Pie of Pie</option>
+        <option value="Bar of Pie">Bar of Pie</option>
+        <option value="Radar">Radar</option>
+        <option value="Combo">Combo</option>
+      </select>
+    </div>
+    <div class="divider"></div>
+    <div class="cs-section">
+      <div class="cs-label">Color Palette — click to apply to all bars/lines</div>
+      <div class="pal-row" id="csPalRow">
+        <div class="pal-dot" style="background:#5b5ef4" onclick="applyColor('#5b5ef4',this)"></div>
+        <div class="pal-dot" style="background:#10b981" onclick="applyColor('#10b981',this)"></div>
+        <div class="pal-dot" style="background:#f59e0b" onclick="applyColor('#f59e0b',this)"></div>
+        <div class="pal-dot" style="background:#ef4444" onclick="applyColor('#ef4444',this)"></div>
+        <div class="pal-dot" style="background:#8b5cf6" onclick="applyColor('#8b5cf6',this)"></div>
+        <div class="pal-dot" style="background:#06b6d4" onclick="applyColor('#06b6d4',this)"></div>
+        <div class="pal-dot" style="background:#ec4899" onclick="applyColor('#ec4899',this)"></div>
+        <div class="pal-dot" style="background:#84cc16" onclick="applyColor('#84cc16',this)"></div>
+        <div class="pal-dot" style="background:#f97316" onclick="applyColor('#f97316',this)"></div>
+        <div class="pal-dot" style="background:#14b8a6" onclick="applyColor('#14b8a6',this)"></div>
+        <div class="pal-dot" style="background:#0ea5e9" onclick="applyColor('#0ea5e9',this)"></div>
+        <div class="pal-dot" style="background:#a855f7" onclick="applyColor('#a855f7',this)"></div>
+        <input type="color" id="csCustomColor" onchange="applyColor(this.value,null)" style="width:22px;height:22px;cursor:pointer;border:none;background:none;padding:0" title="Custom"/>
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div class="cs-section">
+      <div class="cs-label">Per-Series Colors</div>
+      <div id="csPerColorRow" style="display:flex;gap:5px;flex-wrap:wrap;margin-top:4px"></div>
+    </div>
+    <div class="divider"></div>
+    <div class="cs-section">
+      <div class="cs-label">Category (X-Axis) Colors — color each bar/slice by its label</div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:6px">Each X-axis category gets its own color. Works on all chart types.</div>
+      <label style="display:flex;align-items:center;gap:6px;font-size:11px;cursor:pointer;margin-bottom:8px">
+        <input type="checkbox" id="csCategoryColorOn" onchange="applyCategoryColorToggle()" style="accent-color:var(--primary)"/> Enable per-category colors
+      </label>
+      <div id="csCategoryColorList" style="display:none;max-height:200px;overflow-y:auto;display:none;flex-direction:column;gap:4px"></div>
+    </div>
+    <div class="divider"></div>
+    <div class="cs-section">
+      <div class="cs-label">Bar Width %</div>
+      <input type="range" id="csBarW" min="20" max="100" value="70" style="width:100%" oninput="document.getElementById('csBarWVal').textContent=this.value+'%';applyBarWidth(this.value)"/>
+      <span id="csBarWVal" style="font-size:10px;color:var(--muted)">70%</span>
+    </div>
+    <div class="cs-section">
+      <div class="cs-label">Border Width</div>
+      <div style="display:flex;gap:4px">
+        <button class="btn bo bxs" onclick="applyBorder(0,this)">0px</button>
+        <button class="btn bo bxs" onclick="applyBorder(1,this)">1px</button>
+        <button class="btn bo bxs" onclick="applyBorder(2,this)">2px</button>
+        <button class="btn bo bxs" onclick="applyBorder(3,this)">3px</button>
+        <button class="btn bo bxs" onclick="applyBorder(4,this)">4px</button>
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div class="cs-section">
+      <div class="cs-label">Data Labels</div>
+      <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer;margin-bottom:7px"><input type="checkbox" id="csShowLabels" checked onchange="applyShowLabels()" style="accent-color:var(--primary)"/> Show Data Labels</label>
+      <div style="display:flex;gap:4px;margin-bottom:6px">
+        <button class="btn bo bxs" onclick="applyDec('Off',this)">Off</button>
+        <button class="btn bo bxs" onclick="applyDec('0',this)">0 dec</button>
+        <button class="btn bo bxs" onclick="applyDec('1',this)">1 dec</button>
+        <button class="btn bo bxs" onclick="applyDec('2',this)">2 dec</button>
+        <button class="btn bo bxs" onclick="applyDec('3',this)">3 dec</button>
+      </div>
+      <div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:5px">
+        <span style="font-size:10px;color:var(--muted);min-width:52px">Position:</span>
+        <button class="btn bo bxs" onclick="applyDLPos('outside',this)">Outside</button>
+        <button class="btn bo bxs" onclick="applyDLPos('inside',this)">Inside</button>
+        <button class="btn bo bxs" onclick="applyDLPos('above',this)">Above</button>
+        <button class="btn bo bxs" onclick="applyDLPos('below',this)">Below</button>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer">
+          <input type="checkbox" id="csDLBold" onchange="applyDLStyle()" style="accent-color:var(--primary)"/> Bold
+        </label>
+        <div style="display:flex;align-items:center;gap:4px;font-size:11px">
+          <span style="color:var(--muted)">Color:</span>
+          <input type="color" id="csDLColor" value="#374151" onchange="applyDLStyle()" style="width:26px;height:22px;cursor:pointer;border:1px solid var(--border);border-radius:3px;padding:1px"/>
+        </div>
+      </div>
+    </div>
+    <div class="cs-section" id="csPieLblWrap" style="display:none">
+      <div class="cs-label">Pie / Doughnut Labels Show</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer"><input type="checkbox" id="csPieName" onchange="applyPieLabelOpt()" style="accent-color:var(--primary)"/> Category Name</label>
+        <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer"><input type="checkbox" id="csPiePct" onchange="applyPieLabelOpt()" style="accent-color:var(--primary)"/> %</label>
+        <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer"><input type="checkbox" id="csPieVal" onchange="applyPieLabelOpt()" style="accent-color:var(--primary)"/> Value</label>
+      </div>
+    </div>
+    <div class="cs-section" id="csLineStyleWrap" style="display:none">
+      <div class="cs-label">Line Style</div>
+      <div style="display:flex;gap:4px">
+        <button class="btn bo bxs" onclick="applyLineStyle('smooth',this)">Smooth</button>
+        <button class="btn bo bxs" onclick="applyLineStyle('straight',this)">Straight</button>
+        <button class="btn bo bxs" onclick="applyLineStyle('stepped',this)">Stepped</button>
+      </div>
+    </div>
+    <div class="cs-section" id="csGTWrap">
+      <div class="cs-label">Grand Total Column</div>
+      <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer"><input type="checkbox" id="csGrandTotal" onchange="applyGrandTotal()" style="accent-color:var(--primary)"/> Show Grand Total bar/slice</label>
+    </div>
+    <div class="cs-section">
+      <div class="cs-label">Axis</div>
+      <div style="display:flex;gap:10px">
+        <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer"><input type="checkbox" id="csShowX" checked onchange="applyAxis()" style="accent-color:var(--primary)"/> X Axis</label>
+        <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer"><input type="checkbox" id="csShowY" checked onchange="applyAxis()" style="accent-color:var(--primary)"/> Y Axis</label>
+        <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer"><input type="checkbox" id="csBoldAxis" onchange="applyAxis()" style="accent-color:var(--primary)"/> Bold</label>
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div class="cs-section">
+      <div class="cs-label">Chart Filter — X Axis Value Filter (Excel-style)</div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:6px">Select which categories to include in this chart. Uncheck to hide from chart.</div>
+      <div style="display:flex;gap:5px;margin-bottom:5px">
+        <button class="btn bo bxs" onclick="csFilterAll(true)">✔ All</button>
+        <button class="btn bo bxs" onclick="csFilterAll(false)">✕ None</button>
+      </div>
+      <div id="csFilterList" style="max-height:180px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--r);padding:5px 7px;display:flex;flex-direction:column;gap:3px"></div>
+    </div>
+    <div class="divider"></div>
+    <div class="cs-section">
+      <div class="cs-label">Chart Filter Requirement</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer"><input type="checkbox" id="csShowFilter" checked onchange="applyFilterSetting()" style="accent-color:var(--primary)"/> Show filter strip on widget</label>
+        <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer"><input type="checkbox" id="csAllowFilter" checked onchange="applyFilterSetting()" style="accent-color:var(--primary)"/> Allow users to use it</label>
+        <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer"><input type="checkbox" id="csAllowSettings" checked onchange="applyFilterSetting()" style="accent-color:var(--primary)"/> Allow users to open ⚙</label>
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div class="cs-section">
+      <div class="cs-label">Widget Width &amp; Height</div>
+      <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px">
+        <button class="btn bo bxs" onclick="applyWW('w25',this)">¼</button>
+        <button class="btn bo bxs" onclick="applyWW('w33',this)">⅓</button>
+        <button class="btn bo bxs" onclick="applyWW('w50',this)">½</button>
+        <button class="btn bo bxs" onclick="applyWW('w66',this)">⅔</button>
+        <button class="btn bo bxs" onclick="applyWW('w75',this)">¾</button>
+        <button class="btn bo bxs" onclick="applyWW('w100',this)">Full</button>
+      </div>
+      <div style="display:flex;gap:4px;margin-bottom:8px">
+        <button class="btn bo bxs" onclick="applyWH('hs',this)">S (220)</button>
+        <button class="btn bo bxs" onclick="applyWH('hm',this)">M (300)</button>
+        <button class="btn bo bxs" onclick="applyWH('hlg',this)">L (380)</button>
+      </div>
+      <div style="background:var(--s2);border-radius:var(--r);padding:8px 10px;border:1px solid var(--border)">
+        <label style="display:flex;align-items:center;gap:7px;font-size:11px;cursor:pointer;font-weight:600">
+          <input type="checkbox" id="csSizeLock" onchange="applySizeLock()" style="accent-color:var(--primary);width:14px;height:14px"/>
+          🔒 Lock Chart Size (fixed — no resize, no reset on login)
+        </label>
+        <div style="font-size:10px;color:var(--muted);margin-top:4px;margin-left:21px">When ON: chart keeps exact pixel size after logout/login. Resize handle hidden. Width/Height buttons above still work to set a new fixed size.</div>
+        <div id="csSizeLockInfo" style="font-size:10px;color:var(--primary);margin-top:4px;margin-left:21px;display:none"></div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:13px">
+      <button class="btn bp" onclick="saveChartStyle()">✔ Done</button>
+      <button class="btn bd bsm" onclick="deleteChart()">🗑 Delete</button>
+      <button class="btn bo" onclick="closeModal('csModal')">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div class="notify" id="notify"></div>
+<script>
+// ═══ PALETTE & CONSTANTS ═══
+const PAL=['#5b5ef4','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#ec4899','#84cc16','#f97316','#14b8a6'];
+const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+// ═══ CHART.JS GLOBAL PLUGIN SETUP ═══
+if(window.ChartDataLabels)Chart.register(window.ChartDataLabels);
+Chart.defaults.font.family="'Plus Jakarta Sans',sans-serif";
+
+// Faux-3D depth plugin: draws a shaded "side" + "top" slab behind bars, or a
+// shaded under-disc behind pie/doughnut slices, to fake a 3D look on Chart.js
+// (which has no native 3D renderer).
+function shadeColor(hex,pct){
+  try{
+    let c=hex.replace('#','');if(c.length===3)c=c.split('').map(x=>x+x).join('');
+    const n=parseInt(c,16);let r=(n>>16)&255,g=(n>>8)&255,b=n&255;
+    r=Math.max(0,Math.min(255,Math.round(r+(pct<0?r:255-r)*pct)));
+    g=Math.max(0,Math.min(255,Math.round(g+(pct<0?g:255-g)*pct)));
+    b=Math.max(0,Math.min(255,Math.round(b+(pct<0?b:255-b)*pct)));
+    return `rgb(${r},${g},${b})`;
+  }catch(e){return hex;}
+}
+const Faux3DPlugin={
+  id:'faux3d',
+  beforeDatasetsDraw(chart){
+    const opt=chart.config.options?.plugins?.faux3d;if(!opt?.on)return;
+    const ctx=chart.ctx;const depth=opt.depth||10;
+    if(opt.kind==='bar'){
+      const meta0=chart.getDatasetMeta(0);if(!meta0?.data)return;
+      chart.data.datasets.forEach((ds,di)=>{
+        const meta=chart.getDatasetMeta(di);if(meta.hidden||ds.type==='line')return;
+        meta.data.forEach(bar=>{
+          const props=bar.getProps?bar.getProps(['x','y','base','width','height'],true):bar;
+          ctx.save();
+          const color=Array.isArray(ds.backgroundColor)?ds.backgroundColor[0]:ds.backgroundColor;
+          const dark=shadeColor((color||'#5b5ef4').toString(),-.28);
+          if(chart.config.options.indexAxis==='y'){
+            const x0=Math.min(props.x,props.base),x1=Math.max(props.x,props.base);
+            const yTop=props.y-props.height/2;
+            ctx.fillStyle=dark;
+            ctx.beginPath();
+            ctx.moveTo(x1,yTop);ctx.lineTo(x1+depth,yTop-depth);ctx.lineTo(x1+depth,yTop-depth+props.height);ctx.lineTo(x1,yTop+props.height);ctx.closePath();ctx.fill();
+            ctx.fillStyle=shadeColor((color||'#5b5ef4').toString(),.18);
+            ctx.beginPath();ctx.moveTo(x0,yTop);ctx.lineTo(x0+depth,yTop-depth);ctx.lineTo(x1+depth,yTop-depth);ctx.lineTo(x1,yTop);ctx.closePath();ctx.fill();
+          }else{
+            const y0=Math.min(props.y,props.base),y1=Math.max(props.y,props.base);
+            const xR=props.x+props.width/2;
+            ctx.fillStyle=dark;
+            ctx.beginPath();ctx.moveTo(xR,y0);ctx.lineTo(xR+depth,y0-depth);ctx.lineTo(xR+depth,y1-depth);ctx.lineTo(xR,y1);ctx.closePath();ctx.fill();
+            ctx.fillStyle=shadeColor((color||'#5b5ef4').toString(),.18);
+            ctx.beginPath();ctx.moveTo(props.x-props.width/2,y0);ctx.lineTo(props.x-props.width/2+depth,y0-depth);ctx.lineTo(xR+depth,y0-depth);ctx.lineTo(xR,y0);ctx.closePath();ctx.fill();
+          }
+          ctx.restore();
+        });
+      });
+    }
+  },
+  afterDatasetsDraw(chart){
+    const opt=chart.config.options?.plugins?.faux3d;if(!opt?.on||opt.kind!=='pie')return;
+    const meta=chart.getDatasetMeta(0);if(!meta?.data?.length)return;
+    const ctx=chart.ctx;const depth=opt.depth||8;
+    ctx.save();ctx.globalAlpha=.55;
+    meta.data.forEach((arc,i)=>{
+      const p=arc.getProps?arc.getProps(['x','y','startAngle','endAngle','outerRadius','innerRadius'],true):arc;
+      const color=chart.data.datasets[0].backgroundColor[i];
+      ctx.fillStyle=shadeColor((color||'#5b5ef4').toString(),-.3);
+      ctx.beginPath();
+      ctx.arc(p.x,p.y+depth,p.outerRadius,p.startAngle,p.endAngle);
+      ctx.arc(p.x,p.y+depth,p.innerRadius||0,p.endAngle,p.startAngle,true);
+      ctx.closePath();ctx.fill();
+    });
+    ctx.restore();
+  }
+};
+if(window.Chart)Chart.register(Faux3DPlugin);
+
+// ═══ STATE ═══
+const DEF_USERS=[
+  {id:'u1',name:'Admin',email:'admin@demo.com',pass:'admin123',role:'admin',pages:'all',colAccess:{},slicerCols:{},active:true},
+  {id:'u2',name:'User',email:'user@demo.com',pass:'user123',role:'user',pages:[],colAccess:{},slicerCols:{},active:true}
+];
+let S={
+  user:null,
+  users:lsGet('ed2_users',DEF_USERS),
+  pages:lsGet('ed2_pages',[]),
+  // DATA NOW STORED IN LOCALSTORAGE — key: ed2_data_{pid}_{sheet}
+  charts:{},    // cid -> Chart.js instance
+  chartCfg:{},  // cid -> config object
+  kpis:{},      // pid -> []
+  slicers:{},   // pid -> {col:[vals]}
+  slicerCols:{},// pid -> [cols] admin configured
+  slicerMode:{},// pid -> 'chips'|'dropdown'
+  auditLog:lsGet('ed2_audit',[]),
+  chartCount:lsGet('ed2_cc',0),
+  autoTimer:null,
+  upload:null,
+  accessUid:null,
+  currentPid:null,
+  editCid:null,
+  cbSt:{type:'Column 2D',agg:'sum',sort:'none',width:'w50',height:'hm',dec:'0',pieName:true,piePct:true,pieVal:false,barW:70,showX:true,showY:true,bold:false,combo:false,grandTotal:false,showLabels:true,showFilter:true,lineStyle:'smooth',allowSettings:true,allowFilter:true,comboSeries:{}},
+  editUid:null
+};
+function lsGet(k,d){try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}}
+function lsSave(){
+  try{
+    localStorage.setItem('ed2_users',JSON.stringify(S.users));
+    localStorage.setItem('ed2_pages',JSON.stringify(S.pages));
+    localStorage.setItem('ed2_audit',JSON.stringify(S.auditLog));
+    localStorage.setItem('ed2_cc',S.chartCount);
+    const cfgToSave={};
+    Object.keys(S.chartCfg).forEach(cid=>{
+      const c=S.chartCfg[cid];
+      cfgToSave[cid]={pid:c.pid,sn:c.sn,xIdxs:c.xIdxs,xIdx:c.xIdx,yIdxs:c.yIdxs,agg:c.agg,sort:c.sort,type:c.type,width:c.width,height:c.height,dec:c.dec,showX:c.showX,showY:c.showY,bold:c.bold,barW:c.barW,title:c.title,pieOpt:c.pieOpt,combo:c.combo,comboSeries:c.comboSeries,lineStyle:c.lineStyle,grandTotal:c.grandTotal,showLabels:c.showLabels,showFilter:c.showFilter,allowSettings:c.allowSettings,allowFilter:c.allowFilter,perColors:c.perColors,customW:c.customW||null,customH:c.customH||null,csFilter:c.csFilter||null,sizeLocked:c.sizeLocked||false,categoryColors:c.categoryColors||null,dlExtra:c.dlExtra||null};
+    });
+    localStorage.setItem('ed2_chartcfg',JSON.stringify(cfgToSave));
+    localStorage.setItem('ed2_kpis',JSON.stringify(S.kpis));
+    localStorage.setItem('ed2_slicercols',JSON.stringify(S.slicerCols));
+    localStorage.setItem('ed2_slicermode',JSON.stringify(S.slicerMode));
+    // Push to Firebase for cross-network, cross-city, any-device sync.
+    // IMPORTANT: Firebase Realtime Database silently DELETES keys whose value
+    // is an empty array []/{} or undefined. If a user has zero page access,
+    // u.pages=[] would vanish entirely on the next read, leaving u.pages
+    // undefined — which used to crash page rendering for that user.
+    // Fix: sanitize users so "no access" is an explicit marker, never a bare [].
+    const usersForFb=S.users.map(u=>({
+      ...u,
+      pages: (u.pages==='all') ? 'all'
+           : (Array.isArray(u.pages) && u.pages.length>0) ? u.pages
+           : ['__none__'], // explicit sentinel — never an empty array
+      colAccess: (u.colAccess && Object.keys(u.colAccess).length>0) ? u.colAccess : {__none__:[]}
+    }));
+    fbSave({users:usersForFb,pages:S.pages,auditLog:S.auditLog,chartCfg:cfgToSave,kpis:S.kpis,slicerCols:S.slicerCols,slicerMode:S.slicerMode});
+    // Broadcast to same-browser tabs
+    try{if(window._edBC)window._edBC.postMessage({type:'ed2_sync',ts:Date.now()});}catch(e){}
+  }catch(e){console.warn('lsSave error:',e);}
+}
+// Restore all persisted state into S on startup / login
+function lsRestore(){
+  S.chartCfg=lsGet('ed2_chartcfg',{});
+  S.kpis=lsGet('ed2_kpis',{});
+  S.slicerCols=lsGet('ed2_slicercols',{});
+  S.slicerMode=lsGet('ed2_slicermode',{});
+  S.slicers={};// active filter selections are runtime-only; always start fresh
+}
+// Store parsed sheet data persistently
+function saveSheetData(pid,sn,parsed){
+  try{localStorage.setItem(`ed2_data_${pid}_${sn}`,JSON.stringify({headers:parsed.headers,rows:parsed.rows.slice(0,5000)}));}catch(e){}
+}
+function loadSheetData(pid,sn){
+  try{const v=localStorage.getItem(`ed2_data_${pid}_${sn}`);return v?JSON.parse(v):null}catch(e){return null}
+}
+function clearSheetData(pid){
+  try{Object.keys(localStorage).filter(k=>k.startsWith(`ed2_data_${pid}`)).forEach(k=>localStorage.removeItem(k));}catch(e){}
+}
+const isAdmin=()=>S.user?.role==='admin';
+
+// ═══ NOTIFY ═══
+function notify(msg,type='info'){
+  const n=document.getElementById('notify');n.textContent=msg;n.className=`notify show ${type}`;
+  clearTimeout(n._t);n._t=setTimeout(()=>n.classList.remove('show'),3000);
+}
+function audit(action,detail){
+  S.auditLog.unshift({action,detail,user:S.user?.name||'',time:new Date().toLocaleString()});
+  if(S.auditLog.length>300)S.auditLog.length=300;lsSave();
+}
+
+// ═══ THEME ═══
+function toggleTheme(){
+  const h=document.documentElement;const dark=h.dataset.theme==='dark';
+  h.dataset.theme=dark?'light':'dark';
+  document.getElementById('thmBtn').classList.toggle('on',!dark);
+  localStorage.setItem('ed2_theme',dark?'light':'dark');
+}
+(()=>{
+  const t=localStorage.getItem('ed2_theme')||'light';
+  document.documentElement.dataset.theme=t;
+  document.getElementById('thmBtn')?.classList.toggle('on',t==='dark');
+})();
+
+// ═══ LOGIN ═══
+function doLogin(){
+  const email=document.getElementById('lemail').value.trim();
+  const pass=document.getElementById('lpass').value;
+  if(!email||!pass){document.getElementById('lerr').style.display='block';return;}
+  document.getElementById('lerr').style.display='none';
+  document.getElementById('lprog').style.display='block';
+  // Show connecting message so user knows it is working
+  const lbtn=document.getElementById('loginSignInBtn');
+  if(lbtn){lbtn.disabled=true;lbtn.textContent='Connecting…';}
+  function tryLogin(userList){
+    if(lbtn){lbtn.disabled=false;lbtn.textContent='Sign In →';}
+    const u=userList.find(x=>x.email===email&&x.pass===pass&&x.active);
+    if(!u){
+      document.getElementById('lerr').style.display='block';
+      document.getElementById('lprog').style.display='none';
+      return;
+    }
+    S.user=u;
+    document.getElementById('loginPage').style.display='none';
+    document.getElementById('appWrap').style.display='flex';
+    initApp();audit('login',`${u.name} signed in`);
+  }
+  // Always try localStorage first for instant login — Firebase syncs in background
+  const lsUsers=lsGet('ed2_users',DEF_USERS)||[];
+  if(lsUsers.length>0){
+    // Try local first immediately (no waiting)
+    const localMatch=lsUsers.find(x=>x.email===email&&x.pass===pass&&x.active);
+    if(localMatch){tryLogin(lsUsers);return;}
+  }
+  // If not in local, try Firebase with 6s timeout
+  let fbDone=false;
+  const fbTimeout=setTimeout(()=>{
+    if(!fbDone){fbDone=true;tryLogin(S.users);}
+  },6000);
+  if(fbReady){
+    fbLoad().then(d=>{
+      if(fbDone)return;fbDone=true;clearTimeout(fbTimeout);
+      if(d&&d.users&&d.users.length){
+        S.users=d.users;S.pages=d.pages||S.pages;
+        S.chartCfg=d.chartCfg||S.chartCfg;S.kpis=d.kpis||S.kpis;
+        S.slicerCols=d.slicerCols||S.slicerCols;S.slicerMode=d.slicerMode||S.slicerMode;
+        localStorage.setItem('ed2_users',JSON.stringify(S.users));
+        localStorage.setItem('ed2_pages',JSON.stringify(S.pages));
+        localStorage.setItem('ed2_chartcfg',JSON.stringify(S.chartCfg));
+        localStorage.setItem('ed2_kpis',JSON.stringify(S.kpis));
+      }
+      tryLogin(S.users);
+    }).catch(()=>{if(!fbDone){fbDone=true;clearTimeout(fbTimeout);tryLogin(S.users);}});
+  }else{
+    clearTimeout(fbTimeout);tryLogin(S.users);
+  }
+}
+function logout(){
+  S.user=null;clearTimer();
+  document.getElementById('appWrap').style.display='none';
+  document.getElementById('loginPage').style.display='flex';
+  document.getElementById('lprog').style.display='none';
+}
+
+// ═══ INIT ═══
+function initApp(){
+  lsRestore(); // restore chartCfg, kpis, slicerCols, slicerMode from localStorage
+  const u=S.user;
+  document.getElementById('sbAv').textContent=u.name[0].toUpperCase();
+  document.getElementById('sbName').textContent=u.name;
+  document.getElementById('sbRole').textContent=u.role==='admin'?'Administrator':'Member';
+  document.getElementById('adminNavWrap').style.display=isAdmin()?'block':'none';
+  document.getElementById('navAddPage').style.display=isAdmin()?'flex':'none';
+  document.getElementById('navBuilder').style.display=isAdmin()?'flex':'none';
+  document.getElementById('heroAddBtn').style.display=isAdmin()?'inline-flex':'none';
+  document.getElementById('homePgAddBtn').style.display=isAdmin()?'inline-flex':'none';
+  // Point 3: Users see only Pages KPI on home
+  ['homeKpiFiles','homeKpiCharts','homeKpiUsers'].forEach(id=>{
+    const el=document.getElementById(id);if(el)el.style.display=isAdmin()?'':'none';
+  });
+  // Point 4: Filter pane admin-only
+  const fpBtn=document.getElementById('filterPaneBtn');
+  if(fpBtn)fpBtn.style.display=isAdmin()?'':'none';
+  const hr=new Date().getHours();
+  document.getElementById('heroTitle').textContent=(hr<12?'Good Morning':hr<18?'Good Afternoon':'Good Evening')+` ${u.name.split(' ')[0]} 👋`;
+  document.getElementById('heroDate').textContent=new Date().toLocaleDateString('en-IN',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
+  rebuildNav();gotoPage('home');updateStats();if(isAdmin())renderUsers();
+  initBuilderUI(); // populate all builder button rows
+  // Show Firebase status in console for debugging
+  setTimeout(()=>{
+    if(isAdmin())console.log('Firebase ready:',fbReady,'apiKey set:',FB_CONFIG.apiKey!=='AIzaSyDEMO_REPLACE_WITH_YOUR_KEY');
+  },2000);
+  // Cross-tab sync (Bug 5): listen for changes from other tabs on same browser
+  try{
+    window._edBC=new BroadcastChannel('ed2_sync');
+    window._edBC.onmessage=function(ev){
+      if(ev.data?.type==='ed2_sync'&&S.user){
+        S.users=lsGet('ed2_users',[]);
+        S.pages=lsGet('ed2_pages',[]);
+        S.chartCfg=lsGet('ed2_chartcfg',{});
+        S.kpis=lsGet('ed2_kpis',{});
+        S.slicerCols=lsGet('ed2_slicercols',{});
+        S.slicerMode=lsGet('ed2_slicermode',{});
+        const me=S.users.find(u=>u&&u.id===S.user.id);
+        if(!me){console.warn('ExcelDash: user id not found after sync, keeping current session');return;}
+        if(!me.active){doLogout();return;}
+        S.user=me;
+        rebuildNav();updateStats();
+        // Re-render currently open page fully — charts, KPIs, slicers all refresh
+        if(S.currentPid){
+          const pid=S.currentPid;
+          const p=S.pages.find(x=>x.id===pid);
+          if(!p){openHome();return;}
+          const sn=p.activeSheet||p.sheetNames?.[0];
+          const parsed=getParsed(pid,sn);
+          if(parsed){
+            buildSlicers(pid,parsed);
+            const fr=getFilteredRows(pid,parsed);
+            renderKPIs(pid,parsed,fr);
+            // Remove stale widgets and re-inject all from updated chartCfg
+            const grid=document.getElementById(`grid-${pid}`);
+            if(grid){
+              // Destroy old chart instances
+              Object.keys(S.charts).filter(cid=>S.chartCfg[cid]?.pid===pid).forEach(cid=>{S.charts[cid]?.destroy();delete S.charts[cid];});
+              grid.innerHTML='';
+              restorePageWidgets(pid);
+            }
+          }
+          notify('Dashboard updated by Admin ✓','ok');
+        }
+      }
+    };
+  }catch(e){}
+  // Also listen via storage event for cross-window (different window, same browser, same origin)
+  window.addEventListener('storage',function(ev){
+    if(ev.key&&ev.key.startsWith('ed2_')&&S.user){
+      S.users=lsGet('ed2_users',[]);
+      S.pages=lsGet('ed2_pages',[]);
+      S.chartCfg=lsGet('ed2_chartcfg',{});
+      S.kpis=lsGet('ed2_kpis',{});
+      rebuildNav();updateStats();
+    }
+  });
+}
+function myPages(){
+  const u=S.user;if(!u)return[];
+  if(u.role==='admin'||u.pages==='all')return S.pages;
+  // Defensive: Firebase strips empty arrays/undefined on write+read, and we
+  // write an explicit '__none__' sentinel instead (see lsSave). Filter it out
+  // here so it never matches a real page id, and handle missing/bad data safely.
+  if(!u.pages||!Array.isArray(u.pages))return[];
+  return S.pages.filter(p=>u.pages.includes(p.id)&&p.id!=='__none__');
+}
+function myVisibleCols(pid){
+  const p=S.pages.find(x=>x.id===pid);if(!p)return[];
+  const sn=p.activeSheet||p.sheetNames?.[0];
+  const parsed=getParsed(pid,sn);if(!parsed)return[];
+  if(isAdmin())return parsed.headers;
+  const u=S.user;const ca=u&&u.colAccess?u.colAccess[pid]:null;
+  if(!ca||!Array.isArray(ca)||!ca.length||ca.includes('__none__')&&ca.length===0)return parsed.headers;
+  const realCa=ca.filter(c=>c!=='__none__');
+  if(!realCa.length)return parsed.headers;
+  return parsed.headers.filter(h=>realCa.includes(h));
+}
+function rebuildNav(){
+  const c=document.getElementById('dynNav');c.innerHTML='';
+  myPages().forEach(p=>{
+    const el=document.createElement('div');el.className='ni';el.dataset.pid=p.id;
+    el.innerHTML=`<span class="nico">${p.icon||'📊'}</span><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${p.name}</span>`;
+    el.onclick=()=>{openDataPage(p.id);setActiveNav(el);};
+    c.appendChild(el);
+  });
+}
+function setActiveNav(el){document.querySelectorAll('.ni').forEach(n=>n.classList.remove('active'));el.classList.add('active');}
+function gotoPage(id,navEl){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  const pg=document.getElementById('page-'+id);if(pg)pg.classList.add('active');
+  if(navEl)setActiveNav(navEl);
+  const T={home:'🏠 Home',addPage:'➕ Add Page',adminUsers:'👥 Users',auditLog:'📋 Audit',chartBuilder:'🔧 Chart Builder'};
+  document.getElementById('tbTitle').innerHTML=(T[id]||id)+'<span class="tbsub" id="tbSub"></span>';
+  if(id==='home'){updateStats();renderHomePgList();}
+  if(id==='addPage')resetAddPage();
+  if(id==='chartBuilder')initCB();
+  if(id==='auditLog')renderAudit();
+  if(id==='adminUsers')showLastExport();
+}
+function updateStats(){
+  const pg=myPages();const fd=Object.keys(S.pages).length;
+  document.getElementById('kvPg').textContent=pg.length;
+  document.getElementById('kmPg').textContent=pg.length+' active';
+  document.getElementById('kfPg').style.width=Math.min(100,pg.length*10)+'%';
+  const fl=S.pages.filter(p=>loadSheetData(p.id,p.activeSheet||p.sheetNames?.[0])).length;
+  document.getElementById('kvFl').textContent=fl;
+  document.getElementById('kfFl').style.width=Math.min(100,fl*10)+'%';
+  document.getElementById('kvCh').textContent=S.chartCount;
+  document.getElementById('kfCh').style.width=Math.min(100,S.chartCount*5)+'%';
+  document.getElementById('kvUs').textContent=S.users.length;
+  document.getElementById('kmUs').textContent=isAdmin()?'Admin':'Member';
+  document.getElementById('kfUs').style.width=Math.min(100,S.users.length*10)+'%';
+}
+function renderHomePgList(){
+  const pg=myPages();const c=document.getElementById('homePgList');
+  if(!pg.length){c.innerHTML='<div class="empty">No pages yet</div>';return;}
+  c.innerHTML=pg.map(p=>`
+    <div class="pli-item" onclick="openDataPage('${p.id}');setActiveNav(document.querySelector('[data-pid=\\'${p.id}\\']'))">
+      <div style="width:32px;height:32px;border-radius:var(--r);background:var(--pl);color:var(--primary);display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0">${p.icon||'📊'}</div>
+      <div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.name}</div><div style="font-size:10px;color:var(--muted)">${p.filename||'Excel'} · ${(p.sheetNames||[]).length} sheet(s)</div></div>
+      <button class="btn bo bxs" onclick="event.stopPropagation();openDataPage('${p.id}')">Open</button>
+      ${isAdmin()?`<button class="btn bd bxs" onclick="event.stopPropagation();deletePage('${p.id}')">🗑</button>`:''}
+    </div>`).join('');
+}
+function deletePage(pid){
+  if(!confirm('Delete this page and all charts?'))return;
+  audit('delete',`Deleted page: ${S.pages.find(x=>x.id===pid)?.name}`);
+  S.pages=S.pages.filter(p=>p.id!==pid);
+  delete S.kpis[pid];delete S.slicers[pid];delete S.slicerCols[pid];delete S.slicerMode[pid];
+  clearSheetData(pid);
+  // Remove charts for this page
+  Object.keys(S.chartCfg).filter(cid=>S.chartCfg[cid].pid===pid).forEach(cid=>{
+    S.charts[cid]?.destroy();delete S.charts[cid];delete S.chartCfg[cid];
+    document.getElementById(cid)?.remove();
+  });
+  document.getElementById('dp-'+pid)?.remove();
+  lsSave();rebuildNav();updateStats();renderHomePgList();gotoPage('home');
+  notify('Page deleted','info');
+}
+
+// ═══ ADD PAGE ═══
+function resetAddPage(){S.upload=null;document.getElementById('npName').value='';document.getElementById('fileStatus').textContent='';document.getElementById('sheetSel').style.display='none';document.getElementById('previewArea').innerHTML='';}
+function handleDrop(e){e.preventDefault();document.getElementById('uploadZone').classList.remove('drag');processFile(e.dataTransfer.files[0]);}
+function handleFile(e){processFile(e.target.files[0]);}
+function processFile(file){
+  if(!file)return;
+  const ext=file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
+  if(!['.xlsx','.xls','.csv'].includes(ext)){notify('Upload .xlsx .xls or .csv','err');return;}
+  document.getElementById('fileStatus').innerHTML='<div style="display:flex;align-items:center;gap:7px"><div class="spin"></div> Reading '+file.name+'...</div>';
+  const reader=new FileReader();
+  reader.onload=e=>{
+    try{
+      const wb=XLSX.read(new Uint8Array(e.target.result),{type:'array',raw:false});
+      S.upload={workbook:wb,filename:file.name,sheetNames:wb.SheetNames};
+      document.getElementById('fileStatus').innerHTML=`<span style="color:var(--success)">✅ ${file.name} — ${wb.SheetNames.length} sheet(s)</span>`;
+      if(!document.getElementById('npName').value)document.getElementById('npName').value=file.name.replace(/\.(xlsx|xls|csv)$/i,'');
+      const sel=document.getElementById('sheetSelect');sel.innerHTML=wb.SheetNames.map(s=>`<option>${s}</option>`).join('');
+      document.getElementById('sheetSel').style.display='block';previewSheet();notify('File loaded ✓','ok');
+    }catch(err){document.getElementById('fileStatus').innerHTML=`<span style="color:var(--danger)">❌ ${err.message}</span>`;}
+  };reader.readAsArrayBuffer(file);
+}
+function parseSheet(wb,sn){
+  const ws=wb.Sheets[sn];
+  const raw=XLSX.utils.sheet_to_json(ws,{header:1,defval:'',raw:false});
+  let hr=0;for(let i=0;i<Math.min(5,raw.length);i++){if(raw[i].some(c=>c!=='')){{hr=i;break;}}}
+  const headers=raw[hr].map((h,i)=>String(h||'Col'+(i+1)).trim());
+  const rows=raw.slice(hr+1).filter(r=>r.some(c=>c!==''));
+  return{headers,rows};
+}
+const MONTHS_ABBR=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function fmtCell(v){
+  if(v===''||v===null||v===undefined)return '';
+  if(typeof v==='string'){
+    const d=new Date(v);
+    if(!isNaN(d)&&(v.includes('/')||v.includes('-')||v.includes('T')))
+      return String(d.getDate()).padStart(2,'0')+'-'+MONTHS_ABBR[d.getMonth()]+'-'+d.getFullYear();
+  }
+  if(typeof v==='number')return v.toLocaleString();
+  return v;
+}
+function getParsed(pid,sn){
+  if(!sn)return null;
+  // Try localStorage first (persistent)
+  const stored=loadSheetData(pid,sn);
+  if(stored)return stored;
+  return null; // Will trigger re-upload prompt
+}
+function previewSheet(){
+  if(!S.upload)return;
+  const sn=document.getElementById('sheetSelect').value;
+  const p=parseSheet(S.upload.workbook,sn);
+  let html=`<div class="tbl-outer"><table><thead><tr>${p.headers.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>`;
+  p.rows.slice(0,5).forEach(r=>{html+='<tr>'+p.headers.map((_,i)=>`<td>${fmtCell(r[i])}</td>`).join('')+'</tr>';});
+  html+='</tbody></table></div>';
+  document.getElementById('previewArea').innerHTML=html;
+}
+function addPage(){
+  const name=document.getElementById('npName').value.trim();const icon=document.getElementById('npIcon').value;
+  if(!name){notify('Name required','err');return;}if(!S.upload){notify('Upload a file first','err');return;}
+  const pid='p'+Date.now();const sn=document.getElementById('sheetSelect').value||S.upload.sheetNames[0];
+  // Parse & store ALL sheets persistently
+  S.upload.sheetNames.forEach(sheet=>{
+    const parsed=parseSheet(S.upload.workbook,sheet);
+    saveSheetData(pid,sheet,parsed);
+  });
+  const page={id:pid,name,icon,filename:S.upload.filename,sheetNames:S.upload.sheetNames,activeSheet:sn,layoutCols:parseInt(document.getElementById('npCols').value)||2,createdBy:S.user.id,createdAt:new Date().toLocaleString()};
+  S.pages.push(page);S.kpis[pid]=[];S.slicers[pid]={};S.slicerCols[pid]=[];S.slicerMode[pid]='chips';
+  lsSave();rebuildNav();updateStats();S.upload=null;
+  audit('create',`Created page: ${name} (${S.upload?.sheetNames?.join(', ')||sn})`);
+  notify(`Page "${name}" created ✓ — data stored permanently`,'ok');gotoPage('home');
+}
+
+// ═══ DATA PAGE ═══
+function openDataPage(pid,skipRestore){
+  const p=S.pages.find(x=>x.id===pid);if(!p)return;
+  S.currentPid=pid;
+  document.getElementById('tbTitle').innerHTML=`${p.icon||'📊'} ${p.name}<span class="tbsub" id="tbSub"> · ${p.activeSheet}</span>`;
+  let pg=document.getElementById('dp-'+pid);
+  if(!pg){pg=buildDPEl(pid);document.querySelector('.content').appendChild(pg);}
+  document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));pg.classList.add('active');
+  loadPageData(pid,skipRestore);buildFP(pid);
+}
+function buildDPEl(pid){
+  const p=S.pages.find(x=>x.id===pid);
+  const div=document.createElement('div');div.className='page';div.id='dp-'+pid;
+  const ad=isAdmin();
+  div.innerHTML=`
+    <div class="toolbar">
+      <div style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--muted)">
+        <div style="width:7px;height:7px;border-radius:50%;background:var(--success)" id="dot-${pid}"></div>
+        <span id="ri-${pid}">—</span>
+      </div>
+      <div class="tsep"></div>
+      <button class="btn bo bsm" onclick="toggleDataPreview('${pid}')" id="dpBtn-${pid}">👁 Data Preview</button>
+      ${ad?`<button class="btn bp bsm" onclick="openKPIModal('${pid}')">+ KPI</button>
+      <button class="btn bo bsm" onclick="openSlicerCfg('${pid}')">⚙ Slicers</button>
+      <button class="btn bo bsm" id="editBtn-${pid}" onclick="toggleEdit('${pid}')">🔓 Edit</button>
+      <button class="btn bo bsm" onclick="saveLayout('${pid}')">💾 Save</button>
+      <button class="btn bo bsm" onclick="reupload('${pid}')">📁 New Data</button>`:''}
+    </div>
+    <div id="dpPreviewWrap-${pid}" style="display:none;margin-bottom:12px">
+      <div class="card" style="padding:10px 13px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <div style="font-size:12px;font-weight:700">📋 Data Preview</div>
+          <button class="btn bo bxs" onclick="toggleDataPreview('${pid}')">✕ Close</button>
+        </div>
+        <div id="dpPreviewTable-${pid}"></div>
+      </div>
+    </div>
+    <div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:10px" id="tabs-${pid}"></div>
+    <div class="kpi-grid" id="kpiRow-${pid}" style="margin-bottom:12px"></div>
+    <div class="slicer-zone" id="slicerZone-${pid}">
+      <div class="slicer-hdr">
+        <div class="slicer-title">🔽 Slicers</div>
+        <div style="display:flex;gap:5px;align-items:center">
+          ${ad?`<select id="slicerModeBtn-${pid}" class="finp" style="padding:3px 7px;font-size:10px;height:26px" onchange="changeSlicerMode('${pid}',this.value)"><option value="chips">Chips</option><option value="dropdown">Dropdown</option></select>`:''}
+          <button class="btn bo bxs" onclick="clearSlicers('${pid}')">✕ Clear</button>
+        </div>
+      </div>
+      <div class="slicer-row" id="slicerRow-${pid}"><div style="font-size:11px;color:var(--muted)">Loading…</div></div>
+    </div>
+    <div class="db-grid" id="grid-${pid}"></div>
+    <input type="file" id="reup-${pid}" accept=".xlsx,.xls,.csv" style="display:none" onchange="handleReup(event,'${pid}')"/>`;
+  return div;
+}
+
+// ═══ LOAD DATA (persistent — from localStorage) ═══
+function loadPageData(pid,skipRestore){
+  const p=S.pages.find(x=>x.id===pid);if(!p)return;
+  buildSheetTabs(pid);
+  const sn=p.activeSheet||p.sheetNames?.[0];
+  const parsed=getParsed(pid,sn);
+  if(parsed){
+    showSheetData(pid,sn,parsed);
+  } else {
+    showReupPrompt(pid);
+  }
+  if(!skipRestore)restorePageWidgets(pid);
+  // Restore edit/lock state from persisted page.locked
+  const locked=p.locked||false;
+  editModeOn[pid]=false; // always start locked after login
+  applyEditMode(pid,locked?'locked':'');
+}
+// Re-inject all chartCfg widgets that belong to this page and aren't already rendered
+function restorePageWidgets(pid){
+  const grid=document.getElementById(`grid-${pid}`);if(!grid)return;
+  // Restore saved layout order if present
+  const p=S.pages.find(x=>x.id===pid);
+  const savedOrder=p?.widgetOrder||[];
+  // Collect cids for this page
+  const cids=Object.keys(S.chartCfg).filter(cid=>S.chartCfg[cid].pid===pid);
+  // Sort by saved order first, then any new ones appended at end
+  const ordered=[...new Set([...savedOrder.filter(id=>cids.includes(id)),...cids])];
+  ordered.forEach(cid=>{
+    if(!document.getElementById(cid))injectWidget(cid,pid);
+  });
+}
+function showReupPrompt(pid){
+  const p=S.pages.find(x=>x.id===pid);
+  const g=document.getElementById(`grid-${pid}`);if(!g)return;
+  g.innerHTML=`<div style="width:100%;background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:28px;text-align:center">
+    <div style="font-size:28px;margin-bottom:8px">📁</div>
+    <div style="font-size:13px;font-weight:700;margin-bottom:5px">Upload New Data</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:14px">Upload <b>${p.filename||'Excel file'}</b> to add/replace data. Old data cleared on new upload.</div>
+    <button class="btn bp" onclick="reupload('${pid}')">📁 Upload Excel File</button>
+  </div>`;
+  document.getElementById(`dot-${pid}`).style.background='var(--danger)';
+  document.getElementById(`ri-${pid}`).textContent='No data stored';
+}
+function buildSheetTabs(pid){
+  const p=S.pages.find(x=>x.id===pid);const c=document.getElementById(`tabs-${pid}`);if(!c)return;
+  c.innerHTML=(p.sheetNames||[]).map(s=>`<div class="chip${s===p.activeSheet?' on':''}" onclick="switchSheet('${pid}','${s}',this)">${s}</div>`).join('');
+}
+function switchSheet(pid,sn,el){
+  const p=S.pages.find(x=>x.id===pid);p.activeSheet=sn;lsSave();
+  document.querySelectorAll(`#tabs-${pid} .chip`).forEach(c=>c.classList.remove('on'));el.classList.add('on');
+  document.getElementById('tbSub').textContent='· '+sn;
+  S.slicers[pid]={};
+  const parsed=getParsed(pid,sn);
+  if(parsed)showSheetData(pid,sn,parsed);else showReupPrompt(pid);
+}
+function getFilteredRows(pid,parsed){
+  const sl=S.slicers[pid]||{};
+  return parsed.rows.filter(row=>Object.keys(sl).every(col=>{
+    const idx=parsed.headers.indexOf(col);if(idx===-1)return true;
+    const sel=sl[col];if(!sel?.length)return true;
+    return sel.includes(String(row[idx]));
+  }));
+}
+function showSheetData(pid,sn,parsed){
+  const visH=myVisibleCols(pid);
+  const visIdx=parsed.headers.map((h,i)=>visH.includes(h)?i:-1).filter(i=>i!==-1);
+  const fr=getFilteredRows(pid,parsed);
+  buildSlicers(pid,parsed);renderKPIs(pid,parsed,fr);
+  refreshAllCharts(pid,parsed,fr);
+  const now=new Date().toLocaleTimeString();
+  document.getElementById(`ri-${pid}`).textContent=`${fr.length}/${parsed.rows.length} rows · ${now}`;
+  document.getElementById(`dot-${pid}`).style.background='var(--success)';
+  document.getElementById('lastRef').textContent='Updated '+now;
+  notify('Data loaded ✓','ok');
+}
+
+// ═══ SLICERS ═══
+function buildSlicers(pid,parsed){
+  const row=document.getElementById(`slicerRow-${pid}`);if(!row)return;
+  const zone=document.getElementById(`slicerZone-${pid}`);
+  const cols=S.slicerCols[pid]||[]; // NEVER auto-populate — admin must set via ⚙ Slicers
+  if(!cols.length){
+    if(isAdmin()){row.innerHTML='<div style="font-size:11px;color:var(--muted)">No slicers configured. Click <b>⚙ Slicers</b> above to choose columns.</div>';}
+    else{if(zone)zone.style.display='none';}
+    return;
+  }
+  if(zone)zone.style.display='';
+  const mode=S.slicerMode[pid]||'chips';
+  const modeBtn=document.getElementById(`slicerModeBtn-${pid}`);if(modeBtn)modeBtn.value=mode;
+  row.innerHTML=cols.map(col=>{
+    const idx=parsed.headers.indexOf(col);if(idx===-1)return'';
+    const uniq=[...new Set(parsed.rows.map(r=>String(r[idx])).filter(v=>v&&v!==''))].sort().slice(0,50);
+    if(mode==='dropdown'){
+      const cur=S.slicers[pid]?.[col]?.[0]||'';
+      return`<div class="slicer-item"><div class="sl-lbl">${col}</div>
+        <select class="sl-select" onchange="slicerDD('${pid}',${idx},'${col}',this.value)">
+          <option value="">All</option>
+          ${uniq.map(v=>`<option value="${v}"${v===cur?' selected':''}>${v}</option>`).join('')}
+        </select></div>`;
+    }
+    return`<div class="slicer-item"><div class="sl-lbl">${col}</div>
+      <div class="sl-chips" id="sc-${pid}-${idx}">
+        <div class="chip all on" onclick="slicerAll('${pid}',${idx},'${col}',this)">All</div>
+        ${uniq.map(v=>`<div class="chip" onclick="slicerToggle('${pid}',${idx},'${col}','${String(v).replace(/'/g,"\\'")}',this)">${v}</div>`).join('')}
+      </div></div>`;
+  }).join('');
+}
+function changeSlicerMode(pid,mode){S.slicerMode[pid]=mode;const p=S.pages.find(x=>x.id===pid);const parsed=getParsed(pid,p.activeSheet);if(parsed)buildSlicers(pid,parsed);}
+function slicerDD(pid,idx,col,val){
+  S.slicers[pid]=S.slicers[pid]||{};
+  if(!val)delete S.slicers[pid][col];else S.slicers[pid][col]=[val];
+  applyFilter(pid);
+}
+function slicerAll(pid,idx,col,el){
+  S.slicers[pid]=S.slicers[pid]||{};delete S.slicers[pid][col];
+  document.querySelectorAll(`#sc-${pid}-${idx} .chip`).forEach(c=>c.classList.remove('on'));el.classList.add('on');applyFilter(pid);
+}
+function slicerToggle(pid,idx,col,val,el){
+  S.slicers[pid]=S.slicers[pid]||{};if(!S.slicers[pid][col])S.slicers[pid][col]=[];
+  const arr=S.slicers[pid][col];const i=arr.indexOf(val);
+  if(i===-1)arr.push(val);else arr.splice(i,1);
+  if(!arr.length)delete S.slicers[pid][col];
+  document.querySelector(`#sc-${pid}-${idx} .chip.all`)?.classList.toggle('on',!S.slicers[pid][col]);
+  el.classList.toggle('on',i===-1);applyFilter(pid);
+}
+function clearSlicers(pid){
+  S.slicers[pid]={};
+  document.querySelectorAll(`[id^="sc-${pid}-"] .chip`).forEach(c=>c.classList.remove('on'));
+  document.querySelectorAll(`[id^="sc-${pid}-"] .chip.all`).forEach(c=>c.classList.add('on'));
+  applyFilter(pid);
+}
+function applyFilter(pid){
+  const p=S.pages.find(x=>x.id===pid);const parsed=getParsed(pid,p.activeSheet);if(!parsed)return;
+  const fr=getFilteredRows(pid,parsed);
+  renderKPIs(pid,parsed,fr);refreshAllCharts(pid,parsed,fr);buildFP(pid);
+  // Point 4: refresh Data Preview if open so it shows filtered rows
+  const wrap=document.getElementById('dpPreviewWrap-'+pid);
+  if(wrap&&wrap.style.display!=='none'){wrap.style.display='none';toggleDataPreview(pid);}
+}
+// ══ SLICER CONFIG — dedicated function (fixes "⚙ Slicers button not working") ══
+function openSlicerCfg(pid){
+  S.currentPid=pid;
+  // Build slicer config list
+  document.getElementById('slicerCfgList').innerHTML=S.pages.map(p=>{
+    const parsed=getParsed(p.id,p.activeSheet||p.sheetNames?.[0]);
+    if(!parsed)return`<div style="font-size:11px;color:var(--muted);padding:4px 0">${p.name}: upload data first</div>`;
+    const sc=S.slicerCols[p.id]||[];
+    return`<div style="margin-bottom:10px">
+      <div style="font-size:11px;font-weight:700;margin-bottom:4px">${p.icon||'📊'} ${p.name}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:4px">${parsed.headers.map(h=>`
+        <label style="display:flex;align-items:center;gap:3px;font-size:11px;cursor:pointer;padding:2px 7px;border-radius:20px;border:1.5px solid var(--border);background:var(--surface)">
+          <input type="checkbox" data-slicerpid="${p.id}" value="${h}" ${sc.includes(h)?'checked':''} style="accent-color:var(--primary)"/> ${h}
+        </label>`).join('')}
+      </div></div>`;
+  }).join('');
+  // Switch to slicers tab (index 2, since this modal is the standalone slicer modal)
+  document.querySelectorAll('#accessModal .mtab').forEach(t=>t.classList.remove('on'));
+  document.querySelectorAll('#accessModal .mtab-panel').forEach(p=>p.classList.remove('on'));
+  const tabs=document.querySelectorAll('#accessModal .mtab');
+  const panels=document.querySelectorAll('#accessModal .mtab-panel');
+  if(tabs[2])tabs[2].classList.add('on');if(panels[2])panels[2].classList.add('on');
+  // Override modal title
+  document.getElementById('accessModalTitle').textContent='⚙ Slicer Columns';
+  // Temporarily set accessUid so saveAccess can still save slicer cols
+  S.accessUid='__sliceronly__';
+  openModal('accessModal');
+}
+
+// ═══ KPI ═══
+function openKPIModal(pid){
+  S.currentPid=pid;const p=S.pages.find(x=>x.id===pid);const parsed=getParsed(pid,p.activeSheet);if(!parsed){notify('Load data first','err');return;}
+  document.getElementById('kpiCol').innerHTML=parsed.headers.map(h=>`<option>${h}</option>`).join('');
+  openModal('kpiModal');
+}
+function aggVal(rows,headers,col,agg){
+  const idx=headers.indexOf(col);if(idx===-1)return'N/A';
+  const vals=rows.map(r=>r[idx]).filter(v=>v!==''&&v!==undefined);
+  if(agg==='count')return vals.length;if(agg==='countd')return new Set(vals.map(String)).size;
+  const nums=vals.map(v=>parseFloat(v)).filter(v=>!isNaN(v));if(!nums.length)return'N/A';
+  if(agg==='sum')return nums.reduce((a,b)=>a+b,0);if(agg==='avg')return+(nums.reduce((a,b)=>a+b,0)/nums.length).toFixed(2);
+  if(agg==='min')return Math.min(...nums);if(agg==='max')return Math.max(...nums);return'N/A';
+}
+function addKPI(){
+  const pid=S.currentPid;
+  const label=document.getElementById('kpiLabel').value.trim()||document.getElementById('kpiCol').value;
+  const cfg={label,col:document.getElementById('kpiCol').value,agg:document.getElementById('kpiAgg').value,
+    color:document.getElementById('kpiColor').value,icon:document.getElementById('kpiIcon').value||'📊',
+    dec:parseInt(document.getElementById('kpiDec').value),showMeta:document.getElementById('kpiShowMeta').value};
+  S.kpis[pid]=S.kpis[pid]||[];S.kpis[pid].push(cfg);closeModal('kpiModal');
+  const p=S.pages.find(x=>x.id===pid);const parsed=getParsed(pid,p.activeSheet);
+  if(parsed)renderKPIs(pid,parsed,getFilteredRows(pid,parsed));
+  notify('KPI added ✓','ok');document.getElementById('kpiLabel').value='';document.getElementById('kpiIcon').value='';
+}
+function renderKPIs(pid,parsed,fr){
+  const el=document.getElementById(`kpiRow-${pid}`);if(!el)return;
+  // USER VIEW: show only a single "My Pages" count KPI (no data KPIs)
+  if(!isAdmin()){
+    const pgCount=myPages().length;
+    el.innerHTML=`<div class="kpi-card kc-blue">
+      <div class="kpi-ico">📊</div>
+      <div class="kpi-lbl">My Pages</div>
+      <div class="kpi-val">${pgCount}</div>
+    </div>`;
+    return;
+  }
+  // ADMIN VIEW: show all configured KPI cards
+  const kpis=S.kpis[pid]||[];
+  if(!kpis.length){el.innerHTML='';return;}
+  el.innerHTML=kpis.map((k,i)=>{
+    const v=aggVal(fr,parsed.headers,k.col,k.agg);
+    const allV=aggVal(parsed.rows,parsed.headers,k.col,k.agg);
+    const pct=allV&&typeof allV==='number'&&allV>0?Math.min(100,Math.round((typeof v==='number'?v:0)/allV*100)):100;
+    let fv;
+    if(typeof v==='number'){
+      const dec=k.dec!==undefined?k.dec:-1;
+      if(dec===-1){fv=Number.isInteger(v)?v.toLocaleString():parseFloat(v.toFixed(2)).toLocaleString();}
+      else{fv=v.toFixed(dec).replace(/\B(?=(\d{3})+(?!\d))/g,',');}
+    }else{fv=String(v);}
+    const showMeta=k.showMeta||'none';let metaStr='';
+    if(showMeta==='agg')metaStr={sum:'Sum',count:'Count',avg:'Avg',min:'Min',max:'Max',countd:'Distinct'}[k.agg]||k.agg;
+    else if(showMeta==='pct')metaStr=pct+'% of total';
+    else if(showMeta==='both')metaStr=({sum:'Sum',count:'Count',avg:'Avg',min:'Min',max:'Max',countd:'Distinct'}[k.agg]||k.agg)+' · '+pct+'% of total';
+    return`<div class="kpi-card ${k.color||'kc-blue'}" style="position:relative">
+      <div class="kpi-ico">${k.icon||'📊'}</div>
+      <div class="kpi-lbl">${k.label}</div>
+      <div class="kpi-val">${fv}</div>
+      ${metaStr?`<div class="kpi-meta">${metaStr}</div>`:''}
+      <button style="position:absolute;top:6px;left:7px;background:none;border:none;cursor:pointer;font-size:10px;color:var(--muted);opacity:.6" onclick="removeKPI('${pid}',${i})" title="Remove">✕</button>
+    </div>`;
+  }).join('');
+}
+function removeKPI(pid,i){S.kpis[pid].splice(i,1);const p=S.pages.find(x=>x.id===pid);const parsed=getParsed(pid,p.activeSheet);if(parsed)renderKPIs(pid,parsed,getFilteredRows(pid,parsed));}
+
+// ═══ CHART BUILDER CONTROLS ═══
+function initCB(){
+  const sel=document.getElementById('cbPage');
+  sel.innerHTML='<option value="">-- Select --</option>'+myPages().map(p=>`<option value="${p.id}">${p.icon||'📊'} ${p.name}</option>`).join('');
+}
+function cbLoadPage(){
+  const pid=document.getElementById('cbPage').value;if(!pid)return;
+  const p=S.pages.find(x=>x.id===pid);if(!p)return;
+  document.getElementById('cbSheet').innerHTML=p.sheetNames.map(s=>`<option>${s}</option>`).join('');
+  cbLoadSheet();
+}
+function cbLoadSheet(){
+  const pid=document.getElementById('cbPage').value;const sn=document.getElementById('cbSheet').value;if(!pid||!sn)return;
+  const parsed=getParsed(pid,sn);if(!parsed){notify('No data stored for this sheet. Upload data first.','err');return;}
+  const visH=isAdmin()?parsed.headers:myVisibleCols(pid);
+  const visIdx=parsed.headers.map((h,i)=>visH.includes(h)?i:-1).filter(i=>i!==-1);
+  document.getElementById('cbX').innerHTML=visH.map((h,i)=>`<option value="${visIdx[i]}">${h}</option>`).join('');
+  document.getElementById('cbY').innerHTML=visH.map((h,i)=>{
+    const isNum=parsed.rows.some(r=>!isNaN(parseFloat(r[visIdx[i]])));
+    return`<option value="${visIdx[i]}"${isNum?' selected':''}>${h}</option>`;
+  }).join('');
+  let html=`<div class="tbl-outer" style="max-height:200px"><table><thead><tr>${visH.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>`;
+  parsed.rows.slice(0,8).forEach(r=>{html+='<tr>'+visIdx.map(i=>`<td>${fmtCell(r[i])}</td>`).join('')+'</tr>';});
+  html+='</tbody></table></div>';
+  if(parsed.rows.length>8)html+=`<div style="font-size:10px;color:var(--muted);padding:4px 8px">${parsed.rows.length} total rows</div>`;
+  document.getElementById('cbDataTable').innerHTML=html;
+  document.getElementById('cbDataInfo').textContent=`${parsed.rows.length} rows × ${visH.length} cols`;
+  if(S.cbSt.type==='Combo')cbBuildComboSeriesUI();
+}
+// ═══ BUILDER UI INIT — populates all button rows (static HTML can't use template literals) ═══
+function initBuilderUI(){
+  const CHART_TYPES=[
+    'Column 2D','Column 3D','Bar 2D','Bar 3D',
+    'Line','Area',
+    'Pie 2D','Pie 3D','Doughnut','Pie of Pie','Bar of Pie',
+    'Radar','Combo'
+  ];
+  const r=document.getElementById('cbTypeRow');
+  if(r)r.innerHTML=CHART_TYPES.map((t,i)=>
+    `<div class="bb${i===0?' on':''}" onclick="cbType('${t}',this)">${t}</div>`).join('');
+
+  const aggRow=document.getElementById('cbAggRow');
+  if(aggRow)aggRow.innerHTML=[['sum','Sum'],['count','Count'],['avg','Avg'],['min','Min'],['max','Max'],['%','%']].map(([v,l],i)=>
+    `<div class="bb${i===0?' on':''}" onclick="cbAgg('${v}',this)">${l}</div>`).join('');
+
+  const sortRow=document.getElementById('cbSortRow');
+  if(sortRow)sortRow.innerHTML=[['none','Default'],['asc','↑ Asc'],['desc','↓ Desc']].map(([v,l],i)=>
+    `<div class="bb${i===0?' on':''}" onclick="cbSort('${v}',this)">${l}</div>`).join('');
+
+  const decRow=document.getElementById('cbDecRow');
+  if(decRow)decRow.innerHTML=[['Off','Off'],['0','0 dec'],['1','1 dec'],['2','2 dec'],['3','3 dec']].map(([v,l],i)=>
+    `<div class="bb${i===1?' on':''}" onclick="cbDec('${v}',this)">${l}</div>`).join('');
+
+  const lsRow=document.getElementById('cbLineStyleRow');
+  if(lsRow)lsRow.innerHTML=[['smooth','Smooth'],['straight','Straight'],['stepped','Stepped']].map(([v,l],i)=>
+    `<div class="bb${i===0?' on':''}" onclick="cbLineStyle('${v}',this)">${l}</div>`).join('');
+
+  const wRow=document.getElementById('cbWidthRow');
+  if(wRow)wRow.innerHTML=[['w25','¼'],['w33','⅓'],['w50','½'],['w66','⅔'],['w75','¾'],['w100','Full']].map(([v,l],i)=>
+    `<div class="bb${i===2?' on':''}" onclick="cbWidth('${v}',this)">${l}</div>`).join('');
+
+  const hRow=document.getElementById('cbHeightRow');
+  if(hRow)hRow.innerHTML=[['hs','S'],['hm','M'],['hlg','L']].map(([v,l],i)=>
+    `<div class="bb${i===1?' on':''}" onclick="cbHeight('${v}',this)">${l}</div>`).join('');
+}
+function cbType(t,el){
+  document.querySelectorAll('#cbTypeRow .bb').forEach(b=>b.classList.remove('on'));el.classList.add('on');
+  document.getElementById('cbComboWrap').style.display=t==='Combo'?'block':'none';
+  const isPie=['Pie 2D','Pie 3D','Doughnut','Pie of Pie','Bar of Pie'].includes(t);
+  document.getElementById('cbPieLblWrap').style.display=isPie?'block':'none';
+  document.getElementById('cbGTWrap').style.display=isPie?'none':'block';
+  if(t==='Combo')cbBuildComboSeriesUI();
+}
+function cbAgg(a,el){S.cbSt.agg=a;document.querySelectorAll('#cbAggRow .bb').forEach(b=>b.classList.remove('on'));el.classList.add('on');}
+function cbSort(s,el){S.cbSt.sort=s;document.querySelectorAll('#cbSortRow .bb').forEach(b=>b.classList.remove('on'));el.classList.add('on');}
+function cbWidth(w,el){S.cbSt.width=w;document.querySelectorAll('#cbWidthRow .bb').forEach(b=>b.classList.remove('on'));el.classList.add('on');}
+function cbHeight(h,el){S.cbSt.height=h;document.querySelectorAll('#cbHeightRow .bb').forEach(b=>b.classList.remove('on'));el.classList.add('on');}
+function cbDec(d,el){S.cbSt.dec=d;document.querySelectorAll('#cbDecRow .bb').forEach(b=>b.classList.remove('on'));el.classList.add('on');}
+function cbLineStyle(s,el){S.cbSt.lineStyle=s;document.querySelectorAll('#cbLineStyleRow .bb').forEach(b=>b.classList.remove('on'));el.classList.add('on');}
+function cbYChanged(){if(S.cbSt.type==='Combo')cbBuildComboSeriesUI();}
+function cbBuildComboSeriesUI(){
+  const pid=document.getElementById('cbPage').value;const sn=document.getElementById('cbSheet').value;
+  const parsed=getParsed(pid,sn);if(!parsed)return;
+  const yIdxs=Array.from(document.getElementById('cbY').selectedOptions).map(o=>parseInt(o.value));
+  const wrap=document.getElementById('cbComboSeries');
+  if(!yIdxs.length){wrap.innerHTML='<div style="font-size:10px;color:var(--muted)">Select Values (Y Axis) above first</div>';return;}
+  wrap.innerHTML=yIdxs.map(yi=>{
+    const cur=S.cbSt.comboSeries[yi]||{type:'bar',axis:'first',labelMode:'value'};
+    return `<div style="border:1px solid var(--border);border-radius:var(--r);padding:7px 9px">
+      <div style="font-size:11px;font-weight:700;margin-bottom:5px">${parsed.headers[yi]}</div>
+      <div style="display:flex;gap:5px;flex-wrap:wrap">
+        <select class="finp" style="padding:3px 6px;font-size:10px;width:auto" onchange="cbComboSet(${yi},'type',this.value)">
+          <option value="bar"${cur.type==='bar'?' selected':''}>Bar</option>
+          <option value="line"${cur.type==='line'?' selected':''}>Line</option>
+        </select>
+        <select class="finp" style="padding:3px 6px;font-size:10px;width:auto" onchange="cbComboSet(${yi},'axis',this.value)">
+          <option value="first"${cur.axis==='first'?' selected':''}>Left Axis</option>
+          <option value="second"${cur.axis==='second'?' selected':''}>Right Axis</option>
+        </select>
+        <select class="finp" style="padding:3px 6px;font-size:10px;width:auto" onchange="cbComboSet(${yi},'labelMode',this.value)">
+          <option value="off"${(cur.labelMode||'value')==='off'?' selected':''}>Label: Off</option>
+          <option value="value"${(cur.labelMode||'value')==='value'?' selected':''}>Label: Value</option>
+          <option value="pct"${(cur.labelMode||'value')==='pct'?' selected':''}>Label: %</option>
+          <option value="both"${(cur.labelMode||'value')==='both'?' selected':''}>Label: Val+%</option>
+        </select>
+      </div>
+    </div>`;
+  }).join('');
+}
+function cbComboSet(yi,key,val){S.cbSt.comboSeries[yi]=S.cbSt.comboSeries[yi]||{type:'bar',axis:'first',labelMode:'value'};S.cbSt.comboSeries[yi][key]=val;}
+
+// ═══ COMPUTE AGGREGATED DATA ═══
+// xIdxs: array of column indices to group by (multi-select Group By support)
+function computeChartData(pid,sn,xIdxs,yIdxs,agg,sort,grandTotal){
+  const parsed=getParsed(pid,sn);if(!parsed)return null;
+  if(!Array.isArray(xIdxs))xIdxs=[xIdxs];
+  const fr=getFilteredRows(pid,parsed);
+  const groups={};
+  fr.forEach(row=>{
+    const key=xIdxs.map(xi=>row[xi]!==undefined&&row[xi]!==''?row[xi]:'(blank)').join(' / ');
+    if(!groups[key])groups[key]={n:0};
+    yIdxs.forEach(yi=>{
+      if(!groups[key][yi])groups[key][yi]=[];
+      const v=row[yi];groups[key][yi].push(isNaN(parseFloat(v))?0:parseFloat(v));
+    });groups[key].n++;
+  });
+  function doAgg(vals,n){
+    if(agg==='count')return vals.length;if(agg==='countd')return new Set(vals.map(String)).size;
+    if(agg==='avg')return vals.length?+(vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(2):0;
+    if(agg==='min')return vals.length?Math.min(...vals):0;if(agg==='max')return vals.length?Math.max(...vals):0;
+    return vals.reduce((a,b)=>a+b,0);
+  }
+  let labels=Object.keys(groups);let dm={};
+  yIdxs.forEach(yi=>{dm[yi]=labels.map(l=>doAgg(groups[l][yi]||[],groups[l].n));});
+  if(agg==='%'){labels.forEach((l,li)=>{const tot=yIdxs.reduce((s,yi)=>s+(dm[yi][li]||0),0);if(tot>0)yIdxs.forEach(yi=>{dm[yi][li]=+((dm[yi][li]/tot)*100).toFixed(1);});});}
+  if(sort!=='none'){const fi=yIdxs[0];const cmb=labels.map((l,i)=>({l,vs:Object.fromEntries(yIdxs.map(yi=>[yi,dm[yi][i]]))}));cmb.sort((a,b)=>sort==='asc'?a.vs[fi]-b.vs[fi]:b.vs[fi]-a.vs[fi]);labels=cmb.map(x=>x.l);yIdxs.forEach(yi=>{dm[yi]=cmb.map(x=>x.vs[yi]);});}
+  if(grandTotal&&labels.length){
+    labels=[...labels,'Grand Total'];
+    yIdxs.forEach(yi=>{
+      const sum=dm[yi].reduce((a,b)=>a+(b||0),0);
+      dm[yi]=[...dm[yi],agg==='avg'?+(sum/Math.max(1,dm[yi].length)).toFixed(2):agg==='%'?100:sum];
+    });
+  }
+  return{labels,dm,parsed,fr};
+}
+function makeDatasets(yIdxs,dm,parsed,realType,dec,perColors,opts){
+  opts=opts||{};
+  const lineStyle=opts.lineStyle||'smooth';
+  const tension=lineStyle==='smooth'?.4:lineStyle==='stepped'?0:0;
+  const stepped=lineStyle==='stepped';
+  const comboSeries=opts.comboSeries||{};
+  const decNum=dec==='Off'?null:parseInt(dec)||0;
+  const isCombo=opts.combo===true;
+  const dlExtra=opts.dlExtra||{}; // {position,bold,color} from chart settings
+
+  const datasets=yIdxs.map((yi,i)=>{
+    const c=perColors?.[i]||PAL[i%PAL.length];
+    const cs=comboSeries[yi];
+    // For combo: explicit per-series type. For non-combo: use realType.
+    const seriesType=isCombo?(cs?.type||'bar'):realType;
+    const isLine=['line','radar'].includes(seriesType);
+    const labelMode=cs?.labelMode||'value';
+
+    // Per-series datalabel config
+    let dlCfg=undefined;
+    if(isCombo&&cs&&labelMode!=='off'){
+      const anchor=isLine?'center':'end';
+      const align=isLine?'top':'end';
+      dlCfg={display:true,
+        color:dlExtra.color||'#374151',
+        font:{size:10,weight:dlExtra.bold?'bold':'normal'},
+        anchor,align,
+        formatter:(v,ctx)=>{
+          if(typeof v!=='number')return '';
+          const arr=ctx.dataset.data;
+          const total=arr.reduce((a,b)=>a+(typeof b==='number'?b:0),0);
+          const pctStr=total>0?(v/total*100).toFixed(1)+'%':'0%';
+          const valStr=decNum===null?v.toLocaleString():v.toFixed(decNum);
+          if(labelMode==='pct')return pctStr;
+          if(labelMode==='both')return valStr+'\n'+pctStr;
+          return valStr;
+        }};
+    }
+
+    const ds={
+      label:parsed.headers[yi],
+      data:dm[yi],
+      backgroundColor:isLine?c+'33':c,
+      borderColor:c,
+      borderWidth:isLine?2:1,
+      fill:isLine&&realType==='area',
+      tension:isLine?tension:0,
+      stepped:isLine&&stepped,
+      pointRadius:isLine?4:0,
+      pointHoverRadius:isLine?6:0,
+      pointBackgroundColor:c,
+      _dec:dec,_idx:i
+    };
+    if(dlCfg)ds.datalabels=dlCfg;
+
+    // For Combo: must explicitly set Chart.js dataset type and axis
+    if(isCombo){
+      ds.type=seriesType;
+      ds.yAxisID=(cs?.axis==='second')?'y1':'y';
+      if(seriesType==='line'){
+        ds.fill=false;
+        ds.tension=tension;
+        ds.stepped=stepped;
+        ds.pointRadius=4;
+        ds.pointHoverRadius=6;
+        ds.order=0; // lines render on top of bars
+      } else {
+        ds.order=1;
+      }
+    }
+    return ds;
+  });
+
+  // Grand Total dataset for Combo — sum of all BAR series per label
+  if(isCombo&&opts.grandTotal){
+    const barYIdxs=yIdxs.filter(yi=>(comboSeries[yi]?.type||'bar')==='bar');
+    if(barYIdxs.length){
+      const gtData=dm[barYIdxs[0]].map((_,li)=>
+        barYIdxs.reduce((s,yi)=>s+(dm[yi][li]||0),0)
+      );
+      const gtColor='#374151';
+      datasets.push({
+        type:'bar',label:'Grand Total',data:gtData,
+        backgroundColor:gtColor+'22',borderColor:gtColor,
+        borderWidth:2,borderDash:[4,4],
+        yAxisID:'y',order:2,
+        datalabels:{display:true,color:gtColor,font:{size:10,weight:'bold'},anchor:'end',align:'end',
+          formatter:(v)=>decNum===null?v.toLocaleString():v.toFixed(decNum)}
+      });
+    }
+  }
+
+  return datasets;
+}
+function pieLabelFormatter(opt,labels,dec){
+  const decNum=dec==='Off'?null:parseInt(dec)||0;
+  return function(v,ctx){
+    const arr=ctx.dataset.data;const total=arr.reduce((a,b)=>a+(typeof b==='number'?b:0),0);
+    const pct=total>0?(v/total*100):0;
+    const parts=[];
+    if(opt.name)parts.push(labels[ctx.dataIndex]);
+    if(opt.val)parts.push(decNum===null?(typeof v==='number'?v.toLocaleString():v):v.toFixed(decNum));
+    if(opt.pct)parts.push(pct.toFixed(1)+'%');
+    return parts.join('\n')||' ';
+  };
+}
+function makeOpts(realType,agg,showX,showY,bold,dec,pieOpt,labels,extra){
+  extra=extra||{};
+  const isRound=['pie','doughnut','polararea','radar'].includes(realType);
+  const decNum=dec==='Off'?null:parseInt(dec)||0;
+  const showLabels=extra.showLabels!==false;
+  const isPct=agg==='%';
+  const dlExtra=extra.dlExtra||{position:'outside',bold:false,color:'#374151'};
+  // Determine anchor/align from position setting
+  const anchorMap={outside:{anchor:'end',align:'end'},inside:{anchor:'center',align:'center'},above:{anchor:'end',align:'top'},below:{anchor:'start',align:'bottom'}};
+  const {anchor='end',align='end'}=anchorMap[dlExtra.position||'outside']||anchorMap.outside;
+
+  let datalabelsCfg={display:false};
+  if(showLabels){
+    if(isRound&&pieOpt){
+      datalabelsCfg={display:true,color:dlExtra.color||'#fff',
+        font:{size:10,weight:dlExtra.bold?'bold':'bold',family:'Plus Jakarta Sans'},
+        formatter:pieLabelFormatter(pieOpt,labels||[],dec),textAlign:'center'};
+    }else if(decNum!==null){
+      datalabelsCfg={display:true,
+        color:dlExtra.color||'#374151',
+        font:{size:10,weight:dlExtra.bold?'bold':'normal',family:'Plus Jakarta Sans'},
+        formatter:(v)=>{
+          if(typeof v!=='number')return v;
+          const s=decNum===0?Math.round(v).toLocaleString():v.toFixed(decNum);
+          return s+(isPct?'%':'');
+        },
+        anchor,align};
+    }
+  }
+  const tickCb=v=>isPct?v+'%':(typeof v==='number'&&v>=1000?v.toLocaleString():v);
+  const opt={
+    responsive:true,maintainAspectRatio:false,
+    indexAxis:extra.horizontal?'y':'x',
+    plugins:{
+      legend:{position:'top',labels:{font:{size:11,family:'Plus Jakarta Sans'},boxWidth:12,padding:9}},
+      tooltip:{mode:isRound?'point':'index',intersect:false,
+        callbacks:{label:ctx=>{
+          const v=ctx.raw;
+          const disp=decNum===null?(typeof v==='number'?v.toLocaleString():v):(typeof v==='number'?v.toFixed(decNum):v);
+          return ` ${ctx.dataset.label}: ${disp}${isPct?'%':''}`;
+        }}},
+      datalabels:datalabelsCfg,
+      faux3d:{on:!!extra.is3d,kind:isRound?'pie':'bar',depth:isRound?8:10}
+    },
+    scales:isRound?{}:{
+      x:{display:showX,grid:{color:'rgba(0,0,0,.04)'},
+        ticks:{font:{size:10,weight:bold?'bold':'normal',family:'Plus Jakarta Sans'},maxRotation:45}},
+      y:{display:showY,grid:{color:'rgba(0,0,0,.04)'},
+        ticks:{font:{size:10,weight:bold?'bold':'normal',family:'Plus Jakarta Sans'},callback:tickCb},
+        stacked:false}
+    }
+  };
+  if(extra.hasSecondAxis){
+    opt.scales.y1={type:'linear',position:'right',display:true,
+      grid:{drawOnChartArea:false},
+      ticks:{font:{size:10,family:'Plus Jakarta Sans'},callback:tickCb}};
+  }
+  return opt;
+}
+
+// ═══ BUILD CHART ═══
+// Maps builder-friendly type names to Chart.js render types + flags
+function typeInfo(t){
+  const m={
+    'Column 2D':{real:'bar',horizontal:false,is3d:false},
+    'Column 3D':{real:'bar',horizontal:false,is3d:true},
+    'Bar 2D':{real:'bar',horizontal:true,is3d:false},
+    'Bar 3D':{real:'bar',horizontal:true,is3d:true},
+    'Line':{real:'line',horizontal:false,is3d:false},
+    'Area':{real:'line',horizontal:false,is3d:false,area:true},
+    'Pie 2D':{real:'pie',horizontal:false,is3d:false},
+    'Pie 3D':{real:'pie',horizontal:false,is3d:true},
+    'Doughnut':{real:'doughnut',horizontal:false,is3d:false},
+    'Pie of Pie':{real:'pie',horizontal:false,is3d:false,pieOfPie:true},
+    'Bar of Pie':{real:'pie',horizontal:false,is3d:false,barOfPie:true},
+    'Radar':{real:'radar',horizontal:false,is3d:false},
+    'Combo':{real:'bar',horizontal:false,is3d:false,combo:true},
+    // legacy fallbacks
+    'Bar':{real:'bar',horizontal:true,is3d:false},'Column':{real:'bar',horizontal:false,is3d:false},
+    'Pie':{real:'pie',horizontal:false,is3d:false}
+  };
+  return m[t]||{real:(t||'bar').toLowerCase(),horizontal:false,is3d:false};
+}
+function getRealType(t){return typeInfo(t).real;}
+function cbCollectXIdxs(){return Array.from(document.getElementById('cbX').selectedOptions).map(o=>parseInt(o.value));}
+function buildPieGroupedData(res,yi,maxSlices){
+  // For "Pie of Pie" / "Bar of Pie": top N-1 slices kept, rest grouped into "Other"
+  const vals=res.dm[yi];const pairs=res.labels.map((l,i)=>({l,v:vals[i]}));
+  pairs.sort((a,b)=>b.v-a.v);
+  if(pairs.length<=maxSlices)return{labels:pairs.map(p=>p.l),data:pairs.map(p=>p.v)};
+  const top=pairs.slice(0,maxSlices-1);const rest=pairs.slice(maxSlices-1);
+  const otherSum=rest.reduce((s,p)=>s+(p.v||0),0);
+  return{labels:[...top.map(p=>p.l),'Other'],data:[...top.map(p=>p.v),otherSum]};
+}
+function previewChart(){
+  const pid=document.getElementById('cbPage').value;const sn=document.getElementById('cbSheet').value;
+  if(!pid||!sn){notify('Select page & sheet','err');return;}
+  const xIdxs=cbCollectXIdxs();if(!xIdxs.length){notify('Select Group By (X Axis)','err');return;}
+  const yIdxs=Array.from(document.getElementById('cbY').selectedOptions).map(o=>parseInt(o.value)).filter(i=>!xIdxs.includes(i));
+  if(!yIdxs.length){notify('Select Y axis','err');return;}
+  const st=S.cbSt;const ti=typeInfo(st.type);
+  let res=computeChartData(pid,sn,xIdxs,yIdxs,st.agg,st.sort,st.grandTotal&&!['pie','doughnut'].includes(ti.real));if(!res)return;
+  let labels=res.labels,datasets;
+  const pieOpt={name:document.getElementById('cbPieName').checked,pct:document.getElementById('cbPiePct').checked,val:document.getElementById('cbPieVal').checked};
+  if(ti.pieOfPie||ti.barOfPie){
+    const g=buildPieGroupedData(res,yIdxs[0],6);labels=g.labels;
+    datasets=[{label:res.parsed.headers[yIdxs[0]],data:g.data,backgroundColor:labels.map((_,i)=>PAL[i%PAL.length])}];
+  }else{
+    datasets=makeDatasets(yIdxs,res.dm,res.parsed,ti.real,st.dec,null,{combo:ti.combo,comboSeries:st.comboSeries,lineStyle:st.lineStyle,grandTotal:st.grandTotal&&ti.combo});
+    if(ti.area)datasets.forEach(d=>{d.fill=true;});
+    if(['pie','doughnut'].includes(ti.real)&&datasets.length)datasets[0].backgroundColor=labels.map((_,i)=>PAL[i%PAL.length]);
+  }
+  const showLabels=document.getElementById('cbShowLabels').checked;
+  const hasSecondAxis2=ti.combo&&Object.values(st.comboSeries||{}).some(c=>c.axis==='second');
+  const opts=makeOpts(ti.barOfPie?'bar':ti.real,st.agg,document.getElementById('cbShowX').checked,document.getElementById('cbShowY').checked,document.getElementById('cbBoldAxis').checked,st.dec,
+    ['pie','doughnut'].includes(ti.real)||ti.barOfPie?pieOpt:null,labels,{is3d:ti.is3d,showLabels,horizontal:ti.horizontal&&!ti.barOfPie,hasSecondAxis:hasSecondAxis2});
+  if(ti.combo&&hasSecondAxis2)opts.scales.y1={type:'linear',position:'right',display:true,grid:{drawOnChartArea:false},ticks:{font:{size:10},callback:v=>st.agg==='%'?v+'%':v}};
+  if(['bar'].includes(ti.real)&&!ti.barOfPie)opts.datasets={bar:{barPercentage:parseInt(document.getElementById('cbBarW').value)/100}};
+  document.getElementById('cbPreviewCard').style.display='block';
+  document.getElementById('cbPrevTitle').textContent=document.getElementById('cbTitle').value||res.parsed.headers[xIdxs[0]]+' Analysis';
+  const cv=document.getElementById('cbCanvas');if(S.charts['_prev'])S.charts['_prev'].destroy();
+  S.charts['_prev']=new Chart(cv,{type:ti.barOfPie?'bar':ti.real,data:{labels,datasets},options:opts});
+}
+function buildChart(){
+  const pid=document.getElementById('cbPage').value;const sn=document.getElementById('cbSheet').value;
+  if(!pid||!sn){notify('Select page & sheet','err');return;}
+  const xIdxs=cbCollectXIdxs();if(!xIdxs.length){notify('Select Group By (X Axis)','err');return;}
+  const yIdxs=Array.from(document.getElementById('cbY').selectedOptions).map(o=>parseInt(o.value)).filter(i=>!xIdxs.includes(i));
+  if(!yIdxs.length){notify('Select Y axis','err');return;}
+  const st={...S.cbSt,comboSeries:{...S.cbSt.comboSeries}};
+  const title=document.getElementById('cbTitle').value||(()=>{const p=getParsed(pid,sn);return p?p.headers[xIdxs[0]]+' Analysis':'Chart';})();
+  const barW=parseInt(document.getElementById('cbBarW').value)||70;
+  const showX=document.getElementById('cbShowX').checked;const showY=document.getElementById('cbShowY').checked;const bold=document.getElementById('cbBoldAxis').checked;
+  const showLabels=document.getElementById('cbShowLabels').checked;
+  const showFilter=document.getElementById('cbShowFilter').checked;
+  const allowSettings=document.getElementById('cbAllowSettings').checked;
+  const allowFilter=document.getElementById('cbAllowFilter').checked;
+  const pieOpt={name:document.getElementById('cbPieName').checked,pct:document.getElementById('cbPiePct').checked,val:document.getElementById('cbPieVal').checked};
+  const grandTotal=document.getElementById('cbGrandTotal').checked;
+  const cid='c'+Date.now();
+  const cfg={pid,sn,xIdxs,yIdxs,agg:st.agg,sort:st.sort,type:st.type,width:st.width,height:st.height,dec:st.dec,showX,showY,bold,barW,title,pieOpt,combo:st.type==='Combo',comboSeries:st.comboSeries,lineStyle:st.lineStyle,grandTotal,showLabels,showFilter,allowSettings,allowFilter,perColors:null,customW:null,customH:null};
+  S.chartCfg[cid]=cfg;
+  // Navigate to the page WITHOUT triggering restorePageWidgets (pass skipRestore flag)
+  openDataPage(pid,true);
+  // Inject the new chart once, after navigation DOM is ready
+  setTimeout(()=>{
+    if(!document.getElementById(cid))injectWidget(cid,pid); // guard: only if not already rendered
+    S.chartCount++;lsSave();updateStats();
+    notify('Chart added to dashboard ✓','ok');
+    audit('create',`Built chart: ${title}`);
+  },350);
+}
+function injectWidget(cid,pid){
+  const grid=document.getElementById(`grid-${pid}`);if(!grid)return;
+  const cfg=S.chartCfg[cid];if(!cfg)return;
+  const ti=typeInfo(cfg.type);
+  const xIdxs=cfg.xIdxs||[cfg.xIdx]; // backward compat with old single-xIdx charts
+  const res=computeChartData(pid,cfg.sn,xIdxs,cfg.yIdxs,cfg.agg,cfg.sort,cfg.grandTotal&&!['pie','doughnut'].includes(ti.real));if(!res)return;
+  let labels=res.labels,datasets;
+  if(ti.pieOfPie||ti.barOfPie){
+    const g=buildPieGroupedData(res,cfg.yIdxs[0],6);labels=g.labels;
+    datasets=[{label:res.parsed.headers[cfg.yIdxs[0]],data:g.data,backgroundColor:cfg.perColors||labels.map((_,i)=>PAL[i%PAL.length])}];
+  }else{
+    datasets=makeDatasets(cfg.yIdxs,res.dm,res.parsed,ti.real,cfg.dec,cfg.perColors,{combo:ti.combo,comboSeries:cfg.comboSeries,lineStyle:cfg.lineStyle,grandTotal:cfg.grandTotal&&ti.combo,dlExtra:cfg.dlExtra||{}});
+    if(ti.area)datasets.forEach(d=>{d.fill=true;});
+    // Per-category colors for pie/doughnut — compulsory default
+    if(['pie','doughnut'].includes(ti.real)&&datasets.length>0){
+      const colors=(cfg.perColors||labels.map((_,i)=>PAL[i%PAL.length]));
+      datasets[0].backgroundColor=colors;datasets[0].borderColor=colors.map(c=>c+'cc');
+    }
+  }
+  const showSettings=isAdmin(); // ONLY admin sees ⚙ Chart Settings — never users
+  const showFilterStrip=cfg.showFilter!==false;
+  const allowFilterInteract=isAdmin()||cfg.allowFilter!==false;
+  const div=document.createElement('div');
+  div.className=`chart-widget ${cfg.width||'w50'} ${cfg.height||'hm'}`;div.id=cid;
+  const showQBar=isAdmin();
+  const qtypes=[
+    {t:'Column 2D',ic:'▐▌'},{t:'Bar 2D',ic:'≡'},{t:'Line',ic:'∿'},
+    {t:'Pie 2D',ic:'◕'},{t:'Doughnut',ic:'◎'},{t:'Area',ic:'◿'},{t:'Combo',ic:'⧇'}
+  ];
+  div.innerHTML=`
+    <div class="whead">
+      <div style="flex:1;min-width:0">
+        <div class="wtitle" id="wt-${cid}" ${isAdmin()?'ondblclick="editChartTitle(\''+cid+'\')"':''} title="${isAdmin()?'Double-click to rename':cfg.title||'Chart'}">${cfg.title||'Chart'}</div>
+        <div style="font-size:9px;color:var(--muted)">${cfg.type||'Chart'} · ${(cfg.agg||'sum').toUpperCase()} · ${res.fr.length} rows</div>
+      </div>
+      <div class="wactions">
+        ${isAdmin()?'<span class="wdrag-handle">⠿</span>':''}
+        ${isAdmin()?`<button class="btn bo bico" onclick="openCS('${cid}')" title="Chart Settings">⚙</button>`:''}
+        <button class="btn bo bico" onclick="dlChart('${cid}')" title="Download PNG">⬇</button>
+      </div>
+    </div>
+    ${showQBar?`<div class="wqbar" id="wqbar-${cid}">
+      ${qtypes.map(q=>`<div class="wqbtn${cfg.type===q.t?' on':''}" onclick="quickSwitchType('${cid}','${q.t}',this)" title="${q.t}">${q.ic} ${q.t}</div>`).join('')}
+    </div>`:''}
+    <div class="wchart" id="wc-${cid}"><canvas id="cv-${cid}"></canvas></div>
+    ${showFilterStrip?`<div style="padding:6px 11px 8px;border-top:1px solid var(--border)" id="cfwrap-${cid}">
+      <div style="font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">📌 Filter</div>
+      <div id="cf-${cid}" style="display:flex;flex-wrap:wrap;gap:3px${allowFilterInteract?'':';pointer-events:none;opacity:.5'}">
+        <div class="chip all on" onclick="catAll('${cid}',this)">All</div>
+        ${labels.map(l=>`<div class="chip" onclick="catFilter('${cid}','${String(l).replace(/'/g,"\\'")}',this)">${l}</div>`).join('')}
+      </div>
+    </div>`:''}
+    ${isAdmin()?`<div class="resize-se" id="rs-${cid}"></div>`:''}`;
+  grid.appendChild(div);
+  const dlExtra=cfg.dlExtra||{position:'outside',bold:false,color:'#374151'};
+  const hasSecondAxis=ti.combo&&Object.values(cfg.comboSeries||{}).some(c=>c.axis==='second');
+  const opts=makeOpts(ti.barOfPie?'bar':ti.real,cfg.agg,cfg.showX,cfg.showY,cfg.bold||false,cfg.dec,
+    ['pie','doughnut'].includes(ti.real)||ti.barOfPie?(cfg.pieOpt||{name:true,pct:true,val:false}):null,labels,
+    {is3d:ti.is3d,showLabels:cfg.showLabels!==false,horizontal:ti.horizontal&&!ti.barOfPie,hasSecondAxis,dlExtra});
+  if(ti.combo&&hasSecondAxis)opts.scales.y1={type:'linear',position:'right',display:true,grid:{drawOnChartArea:false},ticks:{font:{size:10},callback:v=>cfg.agg==='%'?v+'%':v}};
+  if(ti.real==='bar'&&!ti.barOfPie)opts.datasets={bar:{barPercentage:(cfg.barW||70)/100}};
+  if(S.charts[cid])S.charts[cid].destroy();
+  S.charts[cid]=new Chart(document.getElementById(`cv-${cid}`),{type:ti.barOfPie?'bar':ti.real,data:{labels:[...labels],datasets},options:opts});
+  S.chartCfg[cid]._origLabels=[...labels];S.chartCfg[cid]._origDS=JSON.parse(JSON.stringify(datasets));
+  // Restore category colors if saved
+  if(cfg.categoryColors&&Object.keys(cfg.categoryColors).length)applyAllCategoryColors(cid);
+  // Restore csFilter if saved
+  if(cfg.csFilter&&cfg.csFilter.length&&cfg._origLabels){
+    const filtered=cfg._origLabels.map((l,i)=>({l,i})).filter(x=>cfg.csFilter.includes(String(x.l)));
+    if(filtered.length<cfg._origLabels.length){
+      S.charts[cid].data.labels=filtered.map(x=>x.l);
+      S.charts[cid].data.datasets=cfg._origDS.map(ds=>({...ds,data:filtered.map(x=>ds.data[x.i])}));
+      S.charts[cid].update('none');
+    }
+  }
+  initResizeDrag(cid,pid);
+}
+function refreshAllCharts(pid,parsed,fr){
+  Object.keys(S.chartCfg).forEach(cid=>{
+    if(S.chartCfg[cid].pid===pid&&document.getElementById(cid))rebuildChart(cid);
+  });
+}
+function rebuildChart(cid){
+  const cfg=S.chartCfg[cid];if(!cfg||!document.getElementById(cid))return;
+  const ti=typeInfo(cfg.type);
+  const xIdxs=cfg.xIdxs||[cfg.xIdx];
+  const res=computeChartData(cfg.pid,cfg.sn,xIdxs,cfg.yIdxs,cfg.agg,cfg.sort,cfg.grandTotal&&!['pie','doughnut'].includes(ti.real));if(!res)return;
+  let labels=res.labels,datasets;
+  if(ti.pieOfPie||ti.barOfPie){
+    const g=buildPieGroupedData(res,cfg.yIdxs[0],6);labels=g.labels;
+    datasets=[{label:res.parsed.headers[cfg.yIdxs[0]],data:g.data,backgroundColor:cfg.perColors||labels.map((_,i)=>PAL[i%PAL.length])}];
+  }else{
+    datasets=makeDatasets(cfg.yIdxs,res.dm,res.parsed,ti.real,cfg.dec,cfg.perColors,{combo:ti.combo,comboSeries:cfg.comboSeries,lineStyle:cfg.lineStyle,grandTotal:cfg.grandTotal&&ti.combo,dlExtra:cfg.dlExtra||{}});
+    datasets=makeDatasets(cfg.yIdxs,res.dm,res.parsed,ti.real,cfg.dec,cfg.perColors,{combo:ti.combo,comboSeries:cfg.comboSeries,lineStyle:cfg.lineStyle,grandTotal:cfg.grandTotal&&ti.combo,dlExtra:cfg.dlExtra||{}});
+    if(['pie','doughnut'].includes(ti.real)&&datasets.length>0){
+      const colors=(cfg.perColors||labels.map((_,i)=>PAL[i%PAL.length]));
+      datasets[0].backgroundColor=colors;datasets[0].borderColor=colors.map(c=>c+'cc');
+    }
+  }
+  const inst=S.charts[cid];if(!inst)return;
+  inst.data.labels=[...labels];inst.data.datasets=datasets;inst.update('none');
+  S.chartCfg[cid]._origLabels=[...labels];S.chartCfg[cid]._origDS=JSON.parse(JSON.stringify(datasets));
+  const cf=document.getElementById(`cf-${cid}`);
+  if(cf){
+    const allowFilterInteract=isAdmin()||cfg.allowFilter!==false;
+    cf.style.pointerEvents=allowFilterInteract?'auto':'none';cf.style.opacity=allowFilterInteract?'1':'.5';
+    cf.innerHTML=`<div class="chip all on" onclick="catAll('${cid}',this)">All</div>`+labels.map(l=>`<div class="chip" onclick="catFilter('${cid}','${String(l).replace(/'/g,"\\'")}',this)">${l}</div>`).join('');
+  }
+}
+
+// ═══ CAT FILTER ═══
+function catAll(cid,el){
+  const cfg=S.chartCfg[cid];const inst=S.charts[cid];if(!cfg||!inst)return;
+  inst.data.labels=[...cfg._origLabels];inst.data.datasets=JSON.parse(JSON.stringify(cfg._origDS));inst.update();
+  el.closest('[id^="cf-"]').querySelectorAll('.chip').forEach(c=>c.classList.remove('on'));el.classList.add('on');
+}
+function catFilter(cid,val,el){
+  const cfg=S.chartCfg[cid];const inst=S.charts[cid];if(!cfg||!inst)return;
+  const idx=cfg._origLabels.indexOf(val);if(idx===-1)return;
+  inst.data.labels=[val];inst.data.datasets=cfg._origDS.map(ds=>({...ds,data:[ds.data[idx]]}));inst.update();
+  el.closest('[id^="cf-"]').querySelectorAll('.chip').forEach(c=>c.classList.remove('on'));el.classList.add('on');
+}
+
+let editModeOn={};
+function toggleEdit(pid){
+  editModeOn[pid]=!editModeOn[pid];
+  const p=S.pages.find(x=>x.id===pid);
+  if(p){p.locked=!editModeOn[pid];}// persist lock state: locked=true means edit is OFF
+  lsSave();
+  applyEditMode(pid);
+}
+function applyEditMode(pid){
+  // On first call after login: read persisted locked state from page
+  if(editModeOn[pid]===undefined){
+    const p=S.pages.find(x=>x.id===pid);
+    editModeOn[pid]=p?.locked===false; // only true if explicitly unlocked before
+  }
+  const on=editModeOn[pid]||false;
+  const btn=document.getElementById(`editBtn-${pid}`);
+  if(btn){btn.textContent=on?'🔒 Lock':'🔓 Edit';btn.className=on?'btn bp bsm':'btn bo bsm';}
+  const grid=document.getElementById(`grid-${pid}`);if(!grid)return;
+  grid.querySelectorAll('.chart-widget').forEach(w=>{
+    w.classList.toggle('edit-mode',on);
+    const rs=w.querySelector('.resize-se');if(rs)rs.style.display=on?'block':'none';
+    const dh=w.querySelector('.wdrag-handle');if(dh)dh.style.cursor=on?'grab':'default';
+  });
+  if(on){
+    if(!grid._sortable)grid._sortable=Sortable.create(grid,{animation:150,handle:'.wdrag-handle',ghostClass:'dragging',onEnd:()=>saveLayout(pid)});
+  } else {
+    grid._sortable?.destroy();delete grid._sortable;
+  }
+}
+function saveLayout(pid){
+  const grid=document.getElementById(`grid-${pid}`);
+  if(grid){
+    const order=Array.from(grid.querySelectorAll('.chart-widget')).map(w=>w.id);
+    const p=S.pages.find(x=>x.id===pid);if(p)p.widgetOrder=order;
+  }
+  lsSave();notify('Layout saved ✓','ok');
+}
+function initResizeDrag(cid,pid){
+  const rh=document.getElementById(`rs-${cid}`);const widget=document.getElementById(cid);const wc=document.getElementById(`wc-${cid}`);
+  if(!widget||!wc)return;
+  const cfg=S.chartCfg[cid];
+  // Always restore custom pixel size (persisted from last session)
+  if(cfg?.customW){
+    widget.style.width=cfg.customW+'px';widget.style.flex='none';
+    ['w25','w33','w50','w66','w75','w100'].forEach(c=>widget.classList.remove(c));
+  }
+  if(cfg?.customH){
+    wc.style.height=cfg.customH+'px';
+    ['hs','hm','hlg'].forEach(c=>widget.classList.remove(c));
+  }
+  // If size is locked, hide resize handle — no drag allowed
+  if(cfg?.sizeLocked){if(rh)rh.style.display='none';return;}
+  if(!rh)return;
+  let startX,startY,startW,startH;
+  rh.addEventListener('mousedown',e=>{
+    if(S.chartCfg[cid]?.sizeLocked)return; // double-guard
+    e.preventDefault();e.stopPropagation();
+    startX=e.clientX;startY=e.clientY;
+    startW=widget.offsetWidth;startH=wc.offsetHeight;
+    function onMove(e2){
+      const nw=Math.max(200,startW+(e2.clientX-startX));
+      const nh=Math.max(120,startH+(e2.clientY-startY));
+      widget.style.width=nw+'px';widget.style.flex='none';wc.style.height=nh+'px';
+      ['w25','w33','w50','w66','w75','w100'].forEach(c=>widget.classList.remove(c));
+      ['hs','hm','hlg'].forEach(c=>widget.classList.remove(c));
+      S.charts[cid]?.resize();
+    }
+    function onUp(){
+      document.removeEventListener('mousemove',onMove);document.removeEventListener('mouseup',onUp);
+      if(S.chartCfg[cid]){
+        S.chartCfg[cid].customW=widget.offsetWidth;
+        S.chartCfg[cid].customH=wc.offsetHeight;
+        S.chartCfg[cid].width='';
+        S.chartCfg[cid].height='';
+        lsSave();
+      }
+    }
+    document.addEventListener('mousemove',onMove);document.addEventListener('mouseup',onUp);
+  });
+}
+
+// ═══ CHART STYLE ═══
+function openCS(cid){
+  if(!isAdmin()&&S.chartCfg[cid]?.allowSettings===false){notify('Admin only','err');return;}
+  S.editCid=cid;const cfg=S.chartCfg[cid];
+  // Normalize legacy type names to new names
+  const typeMap={'Bar':'Bar 2D','Column':'Column 2D','Pie':'Pie 2D','bar':'Bar 2D','column':'Column 2D','pie':'Pie 2D','line':'Line','area':'Area','doughnut':'Doughnut','radar':'Radar','combo':'Combo'};
+  if(typeMap[cfg.type])cfg.type=typeMap[cfg.type];
+  const ti=typeInfo(cfg.type);
+  document.getElementById('csTitleInp').value=document.getElementById(`wt-${cid}`)?.textContent||'';
+  // Set chart type select — fallback to Column 2D if type not in list
+  const sel=document.getElementById('csTypeSel');
+  const validTypes=['Column 2D','Column 3D','Bar 2D','Bar 3D','Line','Area','Pie 2D','Pie 3D','Doughnut','Pie of Pie','Bar of Pie','Radar','Combo'];
+  sel.value=validTypes.includes(cfg.type)?cfg.type:'Column 2D';
+  document.getElementById('csBarW').value=cfg.barW||70;
+  document.getElementById('csBarWVal').textContent=(cfg.barW||70)+'%';
+  document.getElementById('csShowX').checked=cfg.showX!==false;
+  document.getElementById('csShowY').checked=cfg.showY!==false;
+  document.getElementById('csBoldAxis').checked=cfg.bold||false;
+  document.getElementById('csShowLabels').checked=cfg.showLabels!==false;
+  document.getElementById('csShowFilter').checked=cfg.showFilter!==false;
+  document.getElementById('csAllowFilter').checked=cfg.allowFilter!==false;
+  document.getElementById('csAllowSettings').checked=cfg.allowSettings!==false;
+  document.getElementById('csGrandTotal').checked=cfg.grandTotal||false;
+  const pieOpt=cfg.pieOpt||{name:true,pct:true,val:false};
+  document.getElementById('csPieName').checked=pieOpt.name!==false;
+  document.getElementById('csPiePct').checked=pieOpt.pct!==false;
+  document.getElementById('csPieVal').checked=pieOpt.val||false;
+  const isPie=['pie','doughnut'].includes(ti.real)||ti.barOfPie;
+  document.getElementById('csPieLblWrap').style.display=isPie?'block':'none';
+  document.getElementById('csGTWrap').style.display=isPie?'none':'block';
+  document.getElementById('csLineStyleWrap').style.display=(ti.real==='line'||ti.combo)?'block':'none';
+  // Per-series / per-category color inputs
+  const parsed=getParsed(cfg.pid,cfg.sn);const pr=document.getElementById('csPerColorRow');
+  if(parsed&&pr){
+    if(['pie','doughnut'].includes(ti.real)&&S.chartCfg[cid]._origLabels){
+      pr.innerHTML=S.chartCfg[cid]._origLabels.map((lbl,i)=>`
+        <div style="display:flex;align-items:center;gap:4px;font-size:10px;color:var(--muted);padding:3px 6px;background:var(--s2);border-radius:var(--r)">
+          <span>${lbl}</span>
+          <input type="color" value="${cfg.perColors?.[i]||PAL[i%PAL.length]}" onchange="applyPieColor(${i},this.value)" style="width:22px;height:22px;cursor:pointer;border:none;background:none;padding:0"/>
+        </div>`).join('');
+    }else if(cfg.yIdxs&&cfg.yIdxs.length){
+      pr.innerHTML=cfg.yIdxs.map((yi,i)=>`
+        <div style="display:flex;align-items:center;gap:4px;font-size:10px;color:var(--muted);padding:3px 6px;background:var(--s2);border-radius:var(--r)">
+          <span>${parsed.headers[yi]||'Series '+(i+1)}</span>
+          <input type="color" value="${cfg.perColors?.[i]||PAL[i%PAL.length]}" onchange="applyPerColor(${i},this.value)" style="width:22px;height:22px;cursor:pointer;border:none;background:none;padding:0"/>
+        </div>`).join('');
+    }else{pr.innerHTML='';}
+  }
+  populateCSFilter(cid);
+  populateCategoryColors(cid);
+  // Size lock state
+  const sizeLockCb=document.getElementById('csSizeLock');
+  const sizeLockInfo=document.getElementById('csSizeLockInfo');
+  if(sizeLockCb){sizeLockCb.checked=cfg.sizeLocked||false;}
+  if(sizeLockInfo){
+    if(cfg.sizeLocked&&cfg.customW){sizeLockInfo.textContent=`Fixed at ${cfg.customW}×${cfg.customH}px`;sizeLockInfo.style.display='block';}
+    else{sizeLockInfo.style.display='none';}
+  }
+  // Data label style state
+  const dle=cfg.dlExtra||{position:'outside',bold:false,color:'#374151'};
+  const dlBold=document.getElementById('csDLBold');const dlColor=document.getElementById('csDLColor');
+  if(dlBold)dlBold.checked=dle.bold||false;
+  if(dlColor)dlColor.value=dle.color||'#374151';
+  // Highlight active position button
+  document.querySelectorAll('#csModal .btn[onclick^="applyDLPos"]').forEach(b=>{
+    b.className=b.getAttribute('onclick').includes(`'${dle.position||'outside'}'`)?'btn bp bxs':'btn bo bxs';
+  });
+  openModal('csModal');
+}
+function csFilterAll(state){
+  document.querySelectorAll('#csFilterList input[type=checkbox]').forEach(cb=>{cb.checked=state;});
+  applyCSFilter();
+}
+function applyCSFilter(){
+  const cid=S.editCid;const cfg=S.chartCfg[cid];const inst=S.charts[cid];if(!cfg||!inst)return;
+  const checked=Array.from(document.querySelectorAll('#csFilterList input[type=checkbox]:checked')).map(cb=>cb.value);
+  cfg.csFilter=checked; // persist selected labels
+  // Apply filter to chart
+  if(!cfg._origLabels)return;
+  const filtered=cfg._origLabels.map((l,i)=>({l,i})).filter(x=>checked.includes(String(x.l)));
+  inst.data.labels=filtered.map(x=>x.l);
+  inst.data.datasets=cfg._origDS.map(ds=>({...ds,data:filtered.map(x=>ds.data[x.i])}));
+  inst.update();
+}
+function populateCSFilter(cid){
+  const cfg=S.chartCfg[cid];const list=document.getElementById('csFilterList');if(!cfg||!list)return;
+  const labels=cfg._origLabels||[];
+  const saved=cfg.csFilter||null;
+  list.innerHTML=labels.map(l=>`
+    <label style="display:flex;align-items:center;gap:6px;font-size:11px;cursor:pointer;padding:2px 0">
+      <input type="checkbox" value="${String(l).replace(/"/g,'&quot;')}" ${!saved||saved.includes(String(l))?'checked':''} onchange="applyCSFilter()" style="accent-color:var(--primary)"/>
+      ${l}
+    </label>`).join('');
+}
+
+// ─── SIZE LOCK (Point 5) ───
+function applySizeLock(){
+  const cid=S.editCid;const cfg=S.chartCfg[cid];if(!cfg)return;
+  const locked=document.getElementById('csSizeLock').checked;
+  cfg.sizeLocked=locked;
+  const info=document.getElementById('csSizeLockInfo');
+  if(locked){
+    // Capture current pixel size right now as the fixed size
+    const widget=document.getElementById(cid);const wc=document.getElementById(`wc-${cid}`);
+    if(widget&&wc){
+      cfg.customW=widget.offsetWidth;cfg.customH=wc.offsetHeight;
+      if(info){info.textContent=`Fixed at ${cfg.customW}×${cfg.customH}px`;info.style.display='block';}
+    }
+    // Hide resize handle immediately
+    const rs=document.getElementById(`rs-${cid}`);if(rs)rs.style.display='none';
+  } else {
+    if(info)info.style.display='none';
+    // Show resize handle again
+    const editOn=editModeOn[cfg.pid]||false;
+    const rs=document.getElementById(`rs-${cid}`);if(rs)rs.style.display=editOn?'block':'none';
+  }
+  lsSave();
+  notify(locked?'Size locked 🔒':'Size unlocked 🔓','ok');
+}
+
+// ─── CATEGORY COLOR (Point 3) ───
+function populateCategoryColors(cid){
+  const cfg=S.chartCfg[cid];
+  const cb=document.getElementById('csCategoryColorOn');
+  const listWrap=document.getElementById('csCategoryColorList');
+  if(!cfg||!cb||!listWrap)return;
+  const on=cfg.categoryColors&&Object.keys(cfg.categoryColors).length>0;
+  cb.checked=on;
+  listWrap.style.display=on?'flex':'none';
+  const labels=cfg._origLabels||[];
+  if(!labels.length){listWrap.innerHTML='<div style="font-size:10px;color:var(--muted)">Build chart first to see categories</div>';return;}
+  listWrap.innerHTML=labels.map((l,i)=>{
+    const cur=(cfg.categoryColors&&cfg.categoryColors[String(l)])||PAL[i%PAL.length];
+    return`<div style="display:flex;align-items:center;gap:8px;padding:2px 0">
+      <input type="color" value="${cur}" data-label="${String(l).replace(/"/g,'&quot;')}" onchange="applyCategoryColor('${cid}','${String(l).replace(/'/g,"\\'")}',this.value)" style="width:26px;height:22px;cursor:pointer;border:1px solid var(--border);border-radius:3px;padding:1px"/>
+      <span style="font-size:11px">${l}</span>
+    </div>`;
+  }).join('');
+}
+function applyCategoryColorToggle(){
+  const cid=S.editCid;const cfg=S.chartCfg[cid];const inst=S.charts[cid];if(!cfg||!inst)return;
+  const on=document.getElementById('csCategoryColorOn').checked;
+  const listWrap=document.getElementById('csCategoryColorList');
+  if(!on){
+    cfg.categoryColors={};
+    listWrap.style.display='none';
+    // Restore series colors
+    rebuildChart(cid);
+    return;
+  }
+  listWrap.style.display='flex';
+  populateCategoryColors(cid);
+  applyAllCategoryColors(cid);
+}
+function applyCategoryColor(cid,label,color){
+  const cfg=S.chartCfg[cid];const inst=S.charts[cid];if(!cfg||!inst)return;
+  cfg.categoryColors=cfg.categoryColors||{};
+  cfg.categoryColors[String(label)]=color;
+  applyAllCategoryColors(cid);
+  lsSave();
+}
+function applyDLPos(pos,btn){
+  const cid=S.editCid;const cfg=S.chartCfg[cid];if(!cfg)return;
+  cfg.dlExtra=cfg.dlExtra||{position:'outside',bold:false,color:'#374151'};
+  cfg.dlExtra.position=pos;
+  btn.closest('div').querySelectorAll('.btn').forEach(b=>b.className='btn bo bxs');btn.className='btn bp bxs';
+  rebuildChart(cid);lsSave();
+}
+function applyDLStyle(){
+  const cid=S.editCid;const cfg=S.chartCfg[cid];if(!cfg)return;
+  cfg.dlExtra=cfg.dlExtra||{position:'outside',bold:false,color:'#374151'};
+  cfg.dlExtra.bold=document.getElementById('csDLBold')?.checked||false;
+  cfg.dlExtra.color=document.getElementById('csDLColor')?.value||'#374151';
+  rebuildChart(cid);lsSave();
+}
+function applyAllCategoryColors(cid){
+  const cfg=S.chartCfg[cid];const inst=S.charts[cid];if(!cfg||!inst)return;
+  if(!cfg.categoryColors||!Object.keys(cfg.categoryColors).length)return;
+  const labels=inst.data.labels||[];
+  const colors=labels.map((l,i)=>cfg.categoryColors[String(l)]||PAL[i%PAL.length]);
+  inst.data.datasets.forEach(ds=>{
+    const rt=ds.type||inst.config.type;
+    if(['pie','doughnut','polarArea'].includes(rt)){
+      // Each slice gets its own color
+      ds.backgroundColor=colors;
+      ds.borderColor=colors.map(c=>c+'cc');
+    } else if(['line','radar'].includes(rt)){
+      // Line: color the line itself + point colors per data point
+      // For lines we color the entire series with the first label color (or set pointBackgroundColor)
+      ds.pointBackgroundColor=colors;
+      ds.pointBorderColor=colors;
+      // optionally color the line itself with first category color
+      if(colors[0])ds.borderColor=colors[0];
+    } else {
+      // Bar/Column/Area: each bar gets its own color
+      ds.backgroundColor=colors.map(c=>c+'cc');
+      ds.borderColor=colors;
+    }
+  });
+  inst.update();
+}
+function applyChartType(newType){
+  const cid=S.editCid;const cfg=S.chartCfg[cid];if(!cfg)return;
+  cfg.type=newType;
+  const pid=cfg.pid;rebuildChartFull(cid,pid);
+  // Refresh modal sub-sections for new type
+  const ti=typeInfo(newType);
+  const isPie=['pie','doughnut'].includes(ti.real)||ti.barOfPie;
+  document.getElementById('csPieLblWrap').style.display=isPie?'block':'none';
+  document.getElementById('csGTWrap').style.display=isPie?'none':'block';
+  document.getElementById('csLineStyleWrap').style.display=(ti.real==='line'||ti.combo)?'block':'none';
+  notify('Chart type changed ✓','ok');
+}
+// Full widget rebuild (used when chart type changes shape, e.g. bar -> pie)
+function rebuildChartFull(cid,pid){
+  const cfg=S.chartCfg[cid];if(!cfg)return;
+  S.charts[cid]?.destroy();delete S.charts[cid];
+  const el=document.getElementById(cid);const wasEditMode=el?.classList.contains('edit-mode');
+  el?.remove();
+  injectWidget(cid,pid);
+  if(wasEditMode)document.getElementById(cid)?.classList.add('edit-mode');
+}
+function applyColor(color,dot){
+  const cid=S.editCid;const inst=S.charts[cid];if(!inst)return;
+  const rt=inst.config.type;
+  inst.data.datasets.forEach((ds)=>{
+    ds.borderColor=color;ds.backgroundColor=['line','radar'].includes(ds.type||rt)?color+'44':color;
+  });inst.update();
+  document.querySelectorAll('#csPalRow .pal-dot').forEach(d=>d.classList.remove('on'));dot?.classList.add('on');
+  notify('Color applied','ok');
+}
+function applyPerColor(idx,color){
+  const cid=S.editCid;const cfg=S.chartCfg[cid];const inst=S.charts[cid];if(!cfg||!inst)return;
+  cfg.perColors=cfg.perColors||[...PAL];cfg.perColors[idx]=color;
+  const ds=inst.data.datasets[idx];if(ds){ds.borderColor=color;const rt=ds.type||inst.config.type;ds.backgroundColor=['line','radar'].includes(rt)?color+'44':color;}
+  inst.update();
+}
+function applyPieColor(idx,color){
+  const cid=S.editCid;const cfg=S.chartCfg[cid];const inst=S.charts[cid];if(!cfg||!inst)return;
+  cfg.perColors=cfg.perColors||S.chartCfg[cid]._origLabels.map((_,i)=>PAL[i%PAL.length]);
+  cfg.perColors[idx]=color;
+  const colors=cfg.perColors;
+  inst.data.datasets.forEach(ds=>{ds.backgroundColor=colors;ds.borderColor=colors.map(c=>c+'cc');});
+  inst.update();
+}
+function applyBarWidth(w){const cid=S.editCid;const cfg=S.chartCfg[cid];const inst=S.charts[cid];if(!inst)return;inst.options.datasets={bar:{barPercentage:w/100}};if(cfg)cfg.barW=parseInt(w);inst.update();}
+function applyBorder(w,btn){
+  const cid=S.editCid;const inst=S.charts[cid];if(!inst)return;
+  inst.data.datasets.forEach(ds=>ds.borderWidth=w);inst.update();
+  btn.closest('div').querySelectorAll('.btn').forEach(b=>b.className='btn bo bxs');btn.className='btn bp bxs';
+}
+function applyDec(d,btn){
+  const cid=S.editCid;const cfg=S.chartCfg[cid];const inst=S.charts[cid];if(!cfg||!inst)return;
+  cfg.dec=d;
+  rebuildChart(cid);
+  btn.closest('div').querySelectorAll('.btn').forEach(b=>b.className='btn bo bxs');btn.className='btn bp bxs';
+  notify('Decimal places updated ✓','ok');
+}
+function applyShowLabels(){
+  const cid=S.editCid;const cfg=S.chartCfg[cid];if(!cfg)return;
+  cfg.showLabels=document.getElementById('csShowLabels').checked;
+  rebuildChart(cid);
+}
+function applyPieLabelOpt(){
+  const cid=S.editCid;const cfg=S.chartCfg[cid];if(!cfg)return;
+  cfg.pieOpt={name:document.getElementById('csPieName').checked,pct:document.getElementById('csPiePct').checked,val:document.getElementById('csPieVal').checked};
+  rebuildChart(cid);
+}
+function applyLineStyle(s,btn){
+  const cid=S.editCid;const cfg=S.chartCfg[cid];if(!cfg)return;
+  cfg.lineStyle=s;rebuildChart(cid);
+  btn.closest('div').querySelectorAll('.btn').forEach(b=>b.className='btn bo bxs');btn.className='btn bp bxs';
+}
+function applyGrandTotal(){
+  const cid=S.editCid;const cfg=S.chartCfg[cid];if(!cfg)return;
+  cfg.grandTotal=document.getElementById('csGrandTotal').checked;
+  rebuildChartFull(cid,cfg.pid);
+}
+function applyFilterSetting(){
+  const cid=S.editCid;const cfg=S.chartCfg[cid];if(!cfg)return;
+  cfg.showFilter=document.getElementById('csShowFilter').checked;
+  cfg.allowFilter=document.getElementById('csAllowFilter').checked;
+  cfg.allowSettings=document.getElementById('csAllowSettings').checked;
+  rebuildChartFull(cid,cfg.pid);
+}
+function applyAxis(){
+  const cid=S.editCid;const cfg=S.chartCfg[cid];const inst=S.charts[cid];if(!inst)return;
+  const sx=document.getElementById('csShowX').checked;const sy=document.getElementById('csShowY').checked;const bo=document.getElementById('csBoldAxis').checked;
+  if(inst.options.scales?.x){inst.options.scales.x.display=sx;if(inst.options.scales.x.ticks)inst.options.scales.x.ticks.font={weight:bo?'bold':'normal',size:10};}
+  if(inst.options.scales?.y){inst.options.scales.y.display=sy;if(inst.options.scales.y.ticks)inst.options.scales.y.ticks.font={weight:bo?'bold':'normal',size:10};}
+  if(cfg){cfg.showX=sx;cfg.showY=sy;cfg.bold=bo;}
+  inst.update();
+}
+function applyWW(cls,btn){
+  const cid=S.editCid;const el=document.getElementById(cid);const cfg=S.chartCfg[cid];if(!el)return;
+  ['w25','w33','w50','w66','w75','w100'].forEach(c=>el.classList.remove(c));
+  el.classList.add(cls);el.style.width='';el.style.flex='';
+  S.charts[cid]?.resize();
+  if(cfg){cfg.width=cls;cfg.customW=null;} // clear pixel override so CSS class takes effect
+  lsSave();
+}
+function applyWH(cls,btn){
+  const cid=S.editCid;const el=document.getElementById(cid);const cfg=S.chartCfg[cid];if(!el)return;
+  const wc=document.getElementById(`wc-${cid}`);
+  ['hs','hm','hlg'].forEach(c=>el.classList.remove(c));el.classList.add(cls);
+  if(wc)wc.style.height='';// let CSS class control height
+  S.charts[cid]?.resize();
+  if(cfg){cfg.height=cls;cfg.customH=null;}
+  lsSave();
+}
+function saveChartStyle(){
+  const cid=S.editCid;const t=document.getElementById('csTitleInp').value.trim();
+  const el=document.getElementById(`wt-${cid}`);if(el&&t)el.textContent=t;
+  if(S.chartCfg[cid]){
+    S.chartCfg[cid].title=t||S.chartCfg[cid].title;
+    S.chartCfg[cid].showX=document.getElementById('csShowX').checked;
+    S.chartCfg[cid].showY=document.getElementById('csShowY').checked;
+    S.chartCfg[cid].bold=document.getElementById('csBoldAxis').checked;
+    S.chartCfg[cid].barW=parseInt(document.getElementById('csBarW').value)||70;
+    S.chartCfg[cid].showLabels=document.getElementById('csShowLabels').checked;
+    S.chartCfg[cid].showFilter=document.getElementById('csShowFilter').checked;
+    S.chartCfg[cid].allowFilter=document.getElementById('csAllowFilter').checked;
+    S.chartCfg[cid].allowSettings=document.getElementById('csAllowSettings').checked;
+    S.chartCfg[cid].grandTotal=document.getElementById('csGrandTotal').checked;
+    S.chartCfg[cid].pieOpt={name:document.getElementById('csPieName').checked,pct:document.getElementById('csPiePct').checked,val:document.getElementById('csPieVal').checked};
+    // Save data label style
+    const dlBold=document.getElementById('csDLBold');const dlColor=document.getElementById('csDLColor');
+    S.chartCfg[cid].dlExtra={
+      position:S.chartCfg[cid].dlExtra?.position||'outside',
+      bold:dlBold?.checked||false,
+      color:dlColor?.value||'#374151'
+    };
+  }
+  lsSave();
+  closeModal('csModal');notify('Saved ✓','ok');
+}
+function deleteChart(){
+  const cid=S.editCid;
+  if(!cid){closeModal('csModal');return;}
+  // Destroy chart instance
+  if(S.charts[cid]){S.charts[cid].destroy();delete S.charts[cid];}
+  // Remove widget DOM element
+  const el=document.getElementById(cid);if(el)el.remove();
+  // Remove from config
+  delete S.chartCfg[cid];
+  // Close modal FIRST, then update state (prevents stale S.editCid reference)
+  closeModal('csModal');
+  S.editCid=null;
+  S.chartCount=Math.max(0,(S.chartCount||1)-1);
+  lsSave();updateStats();
+  notify('Chart deleted','info');
+}
+function dlChart(cid){const c=document.getElementById(`cv-${cid}`);if(!c)return;const a=document.createElement('a');a.href=c.toDataURL('image/png');a.download=`chart-${cid}.png`;a.click();notify('PNG saved','ok');}
+
+// Quick chart-type switcher — directly on widget header bar (no modal needed)
+function quickSwitchType(cid,newType,el){
+  if(!isAdmin()){notify('Admin only','err');return;}
+  const cfg=S.chartCfg[cid];if(!cfg)return;
+  cfg.type=newType;
+  // Update active state on quick bar
+  const bar=document.getElementById(`wqbar-${cid}`);
+  if(bar)bar.querySelectorAll('.wqbtn').forEach(b=>b.classList.toggle('on',b.getAttribute('title')===newType));
+  // Rebuild chart in place (keeps widget, replaces canvas)
+  rebuildChartFull(cid,cfg.pid);
+  lsSave();
+  notify(`Switched to ${newType} ✓`,'ok');
+}
+
+// ═══ FILTER PANE ═══
+function toggleFP(){document.getElementById('filterPane').classList.toggle('open');}
+function buildFP(pid){
+  const body=document.getElementById('fpBody');if(!body)return;
+  const p=S.pages.find(x=>x.id===pid);if(!p)return;
+  const parsed=getParsed(pid,p.activeSheet);if(!parsed){body.innerHTML='<div style="font-size:11px;color:var(--muted)">No data loaded</div>';return;}
+  body.innerHTML=`<div style="font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;margin-bottom:9px">${p.name}</div>`
+    +parsed.headers.map((h,i)=>{
+      const uniq=[...new Set(parsed.rows.map(r=>String(r[i])).filter(v=>v&&v!==''))].sort().slice(0,20);
+      if(uniq.length>20)return'';
+      const isCat=parsed.rows.filter(r=>!isNaN(parseFloat(r[i]))&&r[i]!=='').length<parsed.rows.length*.5;
+      if(!isCat)return'';
+      const cur=S.slicers[pid]?.[h]?.[0]||'';
+      return`<div style="margin-bottom:10px"><div style="font-size:10px;font-weight:700;color:var(--text2);margin-bottom:4px">${h}</div>
+        <select style="width:100%;padding:5px 8px;border:1.5px solid var(--border);border-radius:var(--r);font-size:11px;background:var(--surface);color:var(--text);font-family:var(--font)" onchange="fpFilter('${pid}',${i},'${h}',this.value)">
+          <option value="">All</option>${uniq.map(v=>`<option value="${v}"${v===cur?' selected':''}>${v}</option>`).join('')}
+        </select></div>`;
+    }).join('');
+}
+function fpFilter(pid,idx,col,val){
+  S.slicers[pid]=S.slicers[pid]||{};
+  if(!val)delete S.slicers[pid][col];else S.slicers[pid][col]=[val];
+  applyFilter(pid); // applyFilter also refreshes Data Preview if open
+}
+
+// ═══ USERS & ACCESS ═══
+function renderUsers(){
+  const tb=document.getElementById('usersTbl');if(!tb)return;
+  tb.innerHTML=S.users.map(u=>`<tr>
+    <td><div style="display:flex;align-items:center;gap:6px"><div class="av" style="width:24px;height:24px;font-size:10px">${u.name[0]}</div><b>${u.name}</b></div></td>
+    <td style="color:var(--muted);font-size:11px">${u.email}</td>
+    <td><span class="badge ${u.role==='admin'?'bpu':'bbl'}">${u.role}</span></td>
+    <td>${u.pages==='all'?'<span class="badge bgr">All</span>':`<span class="badge bgr2">${Array.isArray(u.pages)?u.pages.length:0} pg</span>`} <button class="btn bo bxs" onclick="openAccessModal('${u.id}',0)">⚙ Access</button></td>
+    <td><span class="badge ${u.active?'bgr':'brd'}">${u.active?'Active':'Inactive'}</span></td>
+    <td style="display:flex;gap:4px;flex-wrap:wrap">
+      <button class="btn bo bxs" onclick="openEditUser('${u.id}')">✏ Edit</button>
+      <button class="btn ${u.active?'bd':'bs'} bxs" onclick="toggleActive('${u.id}')">${u.active?'Deactivate':'Activate'}</button>
+    </td>
+  </tr>`).join('');
+}
+function openAddUser(){openModal('addUserModal');}
+function openEditUser(uid){
+  const u=S.users.find(x=>x.id===uid);if(!u)return;
+  S.editUid=uid;
+  document.getElementById('euName').value=u.name;
+  document.getElementById('euEmail').value=u.email;
+  document.getElementById('euPass').value='';
+  document.getElementById('euRole').value=u.role;
+  openModal('editUserModal');
+}
+function saveEditUser(){
+  const u=S.users.find(x=>x.id===S.editUid);if(!u)return;
+  const name=document.getElementById('euName').value.trim();
+  const email=document.getElementById('euEmail').value.trim();
+  const pass=document.getElementById('euPass').value;
+  const role=document.getElementById('euRole').value;
+  if(!name||!email){notify('Name and email required','err');return;}
+  // Check email uniqueness (allow same email if it's the same user)
+  if(S.users.find(x=>x.email===email&&x.id!==S.editUid)){notify('Email already in use','err');return;}
+  u.name=name;u.email=email;if(pass)u.pass=pass;
+  const oldRole=u.role;u.role=role;
+  if(role==='admin'&&oldRole!=='admin')u.pages='all';
+  lsSave();renderUsers();closeModal('editUserModal');
+  audit('update',`Edited user: ${name}`);notify('User updated ✓','ok');
+}
+function createUser(){
+  const name=document.getElementById('nuName').value.trim();const email=document.getElementById('nuEmail').value.trim();
+  const pass=document.getElementById('nuPass').value;const role=document.getElementById('nuRole').value;
+  if(!name||!email||!pass){notify('All fields required','err');return;}
+  if(S.users.find(u=>u.email===email)){notify('Email exists','err');return;}
+  S.users.push({id:'u'+Date.now(),name,email,pass,role,pages:role==='admin'?'all':[],colAccess:{},slicerCols:{},active:true});
+  lsSave();renderUsers();closeModal('addUserModal');audit('create',`Created user: ${name}`);notify('User created ✓','ok');
+  ['nuName','nuEmail','nuPass'].forEach(id=>document.getElementById(id).value='');
+}
+function toggleActive(uid){
+  if(uid===S.user.id){notify("Can't deactivate own account",'err');return;}
+  const u=S.users.find(x=>x.id===uid);if(u){u.active=!u.active;lsSave();renderUsers();}
+}
+function openAccessModal(uid,tabIdx){
+  if(uid){S.accessUid=uid;}
+  const u=S.users.find(x=>x.id===S.accessUid);if(!u)return;
+  document.getElementById('accessModalTitle').textContent=`Access — ${u.name}`;
+  document.getElementById('accRole').value=u.role;
+  // Pages
+  document.getElementById('pgAccList').innerHTML=S.pages.length?S.pages.map(p=>`
+    <label style="display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border);cursor:pointer;font-size:12px">
+      <span>${p.icon||'📊'} <b>${p.name}</b></span>
+      <input type="checkbox" value="${p.id}" ${u.pages==='all'||(Array.isArray(u.pages)&&u.pages.includes(p.id)&&p.id!=='__none__')?'checked':''} style="accent-color:var(--primary);width:14px;height:14px"/>
+    </label>`).join(''):'<div style="font-size:12px;color:var(--muted);padding:9px 0">No pages.</div>';
+  // Columns
+  document.getElementById('colAccList').innerHTML=S.pages.map(p=>{
+    const parsed=getParsed(p.id,p.activeSheet||p.sheetNames?.[0]);if(!parsed)return`<div style="font-size:11px;color:var(--muted);padding:4px 0">${p.name}: upload data first</div>`;
+    const ca=(u.colAccess&&u.colAccess[p.id])||[];
+    return`<div style="margin-bottom:10px"><div style="font-size:11px;font-weight:700;margin-bottom:4px">${p.icon||'📊'} ${p.name}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:4px">${parsed.headers.map(h=>`
+        <label style="display:flex;align-items:center;gap:3px;font-size:11px;cursor:pointer;padding:2px 7px;border-radius:20px;border:1.5px solid var(--border);background:var(--surface)">
+          <input type="checkbox" data-pid="${p.id}" value="${h}" ${!ca.length||ca.includes(h)?'checked':''} style="accent-color:var(--primary)"/> ${h}
+        </label>`).join('')}
+      </div></div>`;
+  }).join('');
+  // Slicers
+  document.getElementById('slicerCfgList').innerHTML=S.pages.map(p=>{
+    const parsed=getParsed(p.id,p.activeSheet||p.sheetNames?.[0]);if(!parsed)return`<div style="font-size:11px;color:var(--muted);padding:4px 0">${p.name}: upload data first</div>`;
+    const sc=S.slicerCols[p.id]||[];
+    return`<div style="margin-bottom:10px"><div style="font-size:11px;font-weight:700;margin-bottom:4px">${p.icon||'📊'} ${p.name}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:4px">${parsed.headers.map(h=>`
+        <label style="display:flex;align-items:center;gap:3px;font-size:11px;cursor:pointer;padding:2px 7px;border-radius:20px;border:1.5px solid var(--border);background:var(--surface)">
+          <input type="checkbox" data-slicerpid="${p.id}" value="${h}" ${sc.includes(h)?'checked':''} style="accent-color:var(--primary)"/> ${h}
+        </label>`).join('')}
+      </div></div>`;
+  }).join('');
+  // Switch tab — scope to #accessModal only
+  const modal=document.getElementById('accessModal');
+  modal.querySelectorAll('.mtab').forEach(t=>t.classList.remove('on'));
+  modal.querySelectorAll('.mtab-panel').forEach(p=>p.classList.remove('on'));
+  const tabs=modal.querySelectorAll('.mtab');const panels=modal.querySelectorAll('.mtab-panel');
+  if(tabs[tabIdx])tabs[tabIdx].classList.add('on');if(panels[tabIdx])panels[tabIdx].classList.add('on');
+  openModal('accessModal');
+}
+function showMTab(i,el){
+  const modal=el.closest('.ov');
+  modal.querySelectorAll('.mtab').forEach(t=>t.classList.remove('on'));
+  modal.querySelectorAll('.mtab-panel').forEach(p=>p.classList.remove('on'));
+  el.classList.add('on');modal.querySelector('#mtab-'+i)?.classList.add('on');
+}
+function saveAccess(){
+  // Save slicer column selections (applies in all cases)
+  S.pages.forEach(p=>{
+    const sc=Array.from(document.querySelectorAll(`#slicerCfgList input[data-slicerpid="${p.id}"]:checked`)).map(i=>i.value);
+    S.slicerCols[p.id]=sc;
+  });
+  // If opened from ⚙ Slicers button (slicer-only mode), skip user-access save
+  if(S.accessUid==='__sliceronly__'){
+    lsSave();
+    // Rebuild slicers on current page
+    const pid=S.currentPid;const p=S.pages.find(x=>x.id===pid);
+    if(p){const parsed=getParsed(pid,p.activeSheet||p.sheetNames?.[0]);if(parsed)buildSlicers(pid,parsed);}
+    closeModal('accessModal');notify('Slicer columns saved ✓','ok');
+    return;
+  }
+  const u=S.users.find(x=>x.id===S.accessUid);if(!u){closeModal('accessModal');return;}
+  u.role=document.getElementById('accRole').value;
+  u.pages=Array.from(document.querySelectorAll('#pgAccList input:checked')).map(i=>i.value);
+  u.colAccess=u.colAccess||{};
+  S.pages.forEach(p=>{
+    const checked=Array.from(document.querySelectorAll(`#colAccList input[data-pid="${p.id}"]:checked`)).map(i=>i.value);
+    u.colAccess[p.id]=checked;
+  });
+  lsSave();renderUsers();closeModal('accessModal');audit('update',`Updated access for ${u.name}`);notify('Access saved ✓','ok');
+}
+
+// ═══ CROSS-DEVICE SYNC — JSON Export / Import (Point 12) ═══
+function exportDashboard(){
+  if(!isAdmin()){notify('Admin only','err');return;}
+  // Gather all localStorage keys belonging to this app
+  const snapshot={
+    _version:2,_exported:new Date().toISOString(),
+    users:S.users,pages:S.pages,auditLog:S.auditLog,
+    chartCfg:{},kpis:S.kpis,slicerCols:S.slicerCols,slicerMode:S.slicerMode,
+    sheetData:{}
+  };
+  // Strip runtime cache from chartCfg
+  Object.keys(S.chartCfg).forEach(cid=>{
+    const c=S.chartCfg[cid];
+    snapshot.chartCfg[cid]={pid:c.pid,sn:c.sn,xIdxs:c.xIdxs,xIdx:c.xIdx,yIdxs:c.yIdxs,agg:c.agg,sort:c.sort,type:c.type,width:c.width,height:c.height,dec:c.dec,showX:c.showX,showY:c.showY,bold:c.bold,barW:c.barW,title:c.title,pieOpt:c.pieOpt,combo:c.combo,comboSeries:c.comboSeries,lineStyle:c.lineStyle,grandTotal:c.grandTotal,showLabels:c.showLabels,showFilter:c.showFilter,allowSettings:c.allowSettings,allowFilter:c.allowFilter,perColors:c.perColors};
+  });
+  // Include all sheet data
+  Object.keys(localStorage).forEach(k=>{
+    if(k.startsWith('ed2_data_'))snapshot.sheetData[k]=localStorage.getItem(k);
+  });
+  const blob=new Blob([JSON.stringify(snapshot,null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download=`ExcelDash-backup-${new Date().toISOString().slice(0,10)}.json`;a.click();
+  localStorage.setItem('ed2_lastExport',new Date().toLocaleString());
+  const el=document.getElementById('lastExportTime');if(el)el.textContent=new Date().toLocaleString();
+  audit('export','Dashboard exported to JSON');notify('Dashboard exported ✓','ok');
+}
+function importDashboard(evt){
+  // Both admin and users can import — users need this to load their pages on a new device
+  const file=evt.target.files?.[0];if(!file)return;
+  const reader=new FileReader();
+  reader.onload=e=>{
+    try{
+      const data=JSON.parse(e.target.result);
+      if(!data._version||!data.users||!data.pages){notify('Invalid backup file','err');return;}
+      const msg=isAdmin()
+        ?`Import will OVERWRITE all current data. ${data.pages.length} pages, ${Object.keys(data.chartCfg||{}).length} charts, ${data.users.length} users. Continue?`
+        :`Import dashboard from Admin? This will load ${data.pages.length} pages and your access settings. Continue?`;
+      if(!confirm(msg))return;
+      localStorage.setItem('ed2_users',JSON.stringify(data.users));
+      localStorage.setItem('ed2_pages',JSON.stringify(data.pages));
+      localStorage.setItem('ed2_audit',JSON.stringify(data.auditLog||[]));
+      localStorage.setItem('ed2_chartcfg',JSON.stringify(data.chartCfg||{}));
+      localStorage.setItem('ed2_kpis',JSON.stringify(data.kpis||{}));
+      localStorage.setItem('ed2_slicercols',JSON.stringify(data.slicerCols||{}));
+      localStorage.setItem('ed2_slicermode',JSON.stringify(data.slicerMode||{}));
+      Object.entries(data.sheetData||{}).forEach(([k,v])=>localStorage.setItem(k,v));
+      S.users=data.users;S.pages=data.pages;S.auditLog=data.auditLog||[];
+      S.chartCfg=data.chartCfg||{};S.kpis=data.kpis||{};
+      S.slicerCols=data.slicerCols||{};S.slicerMode=data.slicerMode||{};
+      audit('import',`Dashboard imported from ${file.name}`);
+      notify('Import successful! Refreshing…','ok');
+      setTimeout(()=>location.reload(),1200);
+    }catch(err){notify('Import failed: '+err.message,'err');}
+  };
+  reader.readAsText(file);
+  evt.target.value='';
+}
+// Show last export time on settings page open
+function showLastExport(){
+  const t=localStorage.getItem('ed2_lastExport');
+  const el=document.getElementById('lastExportTime');if(el)el.textContent=t||'Never';
+  const banner=document.getElementById('fbStatusBanner');
+  if(!banner)return;
+  // Check if apiKey is still the demo placeholder
+  const notConfigured=!FB_CONFIG.apiKey||FB_CONFIG.apiKey===''||FB_CONFIG.apiKey==='AIzaSyDEMO_REPLACE_WITH_YOUR_KEY';
+  if(fbReady){
+    banner.style.cssText='background:#f0fdf4;border:1px solid #86efac;border-radius:var(--r);padding:10px 14px;margin-bottom:12px;font-size:12px;font-weight:700;color:#15803d';
+    banner.innerHTML='🟢 <b>Firebase Connected!</b> All employees sync in real time — any city, any device, any network ✓';
+  } else if(notConfigured){
+    banner.style.cssText='background:#fff7ed;border:2px solid #fb923c;border-radius:var(--r);padding:12px 14px;margin-bottom:12px;font-size:11px;color:#7c2d12';
+    banner.innerHTML=`<b style="font-size:12px">🟠 Action Required — Paste Your Firebase Config</b><br><br>
+      Your Firebase project <b>exceldash-sis</b> is ready but the config values are not yet in this file.<br><br>
+      <b>Do this now:</b><ol style="margin:6px 0 0 16px;line-height:2.2">
+      <li>Go to <a href="https://console.firebase.google.com" target="_blank" style="color:#c2410c;font-weight:700">console.firebase.google.com</a> → click <b>exceldash-sis</b></li>
+      <li>Click gear ⚙ → <b>Project settings</b> → <b>General</b> tab → scroll down to <b>Your apps</b></li>
+      <li>Click your web app → copy the config block (apiKey, authDomain, projectId etc.)</li>
+      <li>Open <b>index.html in Notepad</b> → Ctrl+F → search <b>FB_CONFIG</b> → paste your values</li>
+      <li>Save → Upload to GitHub → Reload this page</li></ol>`;
+  } else {
+    let reasonTitle='🟡 Firebase configured but not connected';
+    let reasonBody='Checking the reason…';
+    if(fbLastError==='PERMISSION_DENIED'){
+      reasonTitle='🔴 Database Rules are blocking access';
+      reasonBody=`Your Firebase <b>Realtime Database Rules</b> are denying read/write. This is the most common cause.<br><br>
+        <b>Fix this now:</b>
+        <ol style="margin:6px 0 0 16px;line-height:2.1">
+          <li>Open <a href="https://console.firebase.google.com" target="_blank" style="color:#b91c1c;font-weight:700">Firebase Console</a> → your project</li>
+          <li>Left sidebar → <b>Build → Realtime Database</b></li>
+          <li>Click the <b>Rules</b> tab at the top</li>
+          <li>Replace everything with:
+            <pre style="background:#1e293b;color:#e2e8f0;padding:8px 10px;border-radius:6px;font-size:10px;margin:5px 0;overflow-x:auto">{
+  "rules": {
+    "exceldash": {
+      ".read": true,
+      ".write": true
+    }
+  }
+}</pre>
+          </li>
+          <li>Click <b>Publish</b> → confirm <b>Publish</b> again</li>
+          <li>Come back here and click <b>Retry Connection</b> below</li>
+        </ol>`;
+    } else if(fbLastError==='TIMEOUT'){
+      reasonTitle='🟡 Firebase request timed out';
+      reasonBody=`The page could not reach Firebase within 5 seconds. This usually means:<br>
+        <ul style="margin:6px 0 0 16px;line-height:2.1">
+          <li>Your internet connection is slow or blocked</li>
+          <li>The <code style="background:#fef3c7;padding:1px 4px;border-radius:3px">databaseURL</code> in firebase-config.js is wrong — double-check it matches exactly what's shown on your Realtime Database page in Firebase Console</li>
+          <li>A firewall/VPN/proxy on this network is blocking <code style="background:#fef3c7;padding:1px 4px;border-radius:3px">firebasedatabase.app</code></li>
+        </ul>`;
+    } else if(fbLastError){
+      reasonTitle='🟡 Firebase connection error';
+      reasonBody=`Error detail: <code style="background:#fef3c7;padding:1px 5px;border-radius:3px;font-size:10px">${fbLastError}</code><br>Most often this means the values in <b>firebase-config.js</b> don't match your actual Firebase project. Re-copy them from Firebase Console → Project Settings.`;
+    } else {
+      reasonBody='Still connecting… click Retry below if this stays for more than 10 seconds.';
+    }
+    banner.style.cssText='background:#fef3c7;border:2px solid #fcd34d;border-radius:var(--r);padding:12px 14px;margin-bottom:12px;font-size:11px;color:#78350f';
+    banner.innerHTML=`<b style="font-size:12px">${reasonTitle}</b><br><br>${reasonBody}<br><br>
+      <button class="btn bo bsm" onclick="retryFirebase()">🔄 Retry Connection</button>
+      <a href="https://console.firebase.google.com" target="_blank" class="btn bo bsm" style="text-decoration:none;display:inline-flex">Open Firebase Console</a>`;
+  }
+}
+function retryFirebase(){
+  fbLastError=null;
+  const banner=document.getElementById('fbStatusBanner');
+  if(banner){banner.style.cssText='background:#fef3c7;border:1px solid #fcd34d;border-radius:var(--r);padding:10px 14px;margin-bottom:12px;font-size:11px;font-weight:600;color:#92400e';banner.innerHTML='🟡 Retrying…';}
+  initFirebase();
+  setTimeout(showLastExport,2500);
+}
+function toggleDataPreview(pid){
+  const wrap=document.getElementById('dpPreviewWrap-'+pid);
+  const btn=document.getElementById('dpBtn-'+pid);
+  if(!wrap)return;
+  const visible=wrap.style.display!=='none';
+  if(visible){wrap.style.display='none';if(btn)btn.textContent='👁 Data Preview';return;}
+  const p=S.pages.find(x=>x.id===pid);if(!p)return;
+  const sn=p.activeSheet||p.sheetNames?.[0];
+  const parsed=getParsed(pid,sn);
+  const tbl=document.getElementById('dpPreviewTable-'+pid);if(!tbl)return;
+  if(!parsed){
+    tbl.innerHTML='<div style="font-size:12px;color:var(--muted);padding:8px 0">No data uploaded yet.</div>';
+  }else{
+    const visH=isAdmin()?parsed.headers:myVisibleCols(pid);
+    const visIdx=parsed.headers.map((h,i)=>visH.includes(h)?i:-1).filter(i=>i!==-1);
+    const allRows=parsed.rows;
+    const filteredRows=getFilteredRows(pid,parsed);
+    const hasFilter=filteredRows.length<allRows.length;
+    const showRows=filteredRows;
+    let info=hasFilter?('<b style="color:var(--primary)">'+showRows.length+' filtered</b> of '+allRows.length+' rows'):allRows.length+' rows';
+    info+=' · '+visH.length+' columns'+(hasFilter?' <b style="color:var(--primary)">🔽 Filtered</b>':'');
+    let html='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px">'
+      +'<div style="font-size:10px;color:var(--muted)">'+info+'</div>'
+      +'<div style="font-size:10px;color:var(--muted)">Sheet: <b>'+sn+'</b></div></div>';
+    html+='<div class="tbl-outer" style="max-height:400px"><table><thead><tr>'
+      +visH.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'
+      +showRows.map(r=>'<tr>'+visIdx.map(i=>'<td>'+(r[i]!==undefined&&r[i]!==''?r[i]:'—')+'</td>').join('')+'</tr>').join('')
+      +'</tbody></table></div>';
+    tbl.innerHTML=html;
+  }
+  wrap.style.display='block';if(btn)btn.textContent='✕ Hide Preview';
+}
+function reupload(pid){document.getElementById(`reup-${pid}`)?.click();}
+function handleReup(e,pid){
+  const file=e.target.files[0];if(!file)return;
+  const reader=new FileReader();
+  reader.onload=ev=>{
+    try{
+      const wb=XLSX.read(new Uint8Array(ev.target.result),{type:'array',raw:false});
+      clearSheetData(pid); // Remove old data
+      const p=S.pages.find(x=>x.id===pid);
+      p.sheetNames=wb.SheetNames;p.activeSheet=wb.SheetNames[0];p.filename=file.name;
+      // Store all sheets
+      wb.SheetNames.forEach(sn=>{const parsed=parseSheet(wb,sn);saveSheetData(pid,sn,parsed);});
+      lsSave();buildSheetTabs(pid);
+      const parsed=getParsed(pid,wb.SheetNames[0]);if(parsed)showSheetData(pid,wb.SheetNames[0],parsed);
+      audit('update',`Uploaded new data: ${file.name} for page ${p.name}`);notify('New data uploaded ✓ — old data replaced','ok');
+    }catch(err){notify('Error: '+err.message,'err');}
+  };reader.readAsArrayBuffer(file);
+}
+
+// ═══ EXPORT ═══
+function exportPDF(){window.print();audit('export','Exported PDF');notify('Print dialog opened','info');}
+function exportExcel(){
+  const pid=S.currentPid;if(!pid){notify('Open a page first','err');return;}
+  const p=S.pages.find(x=>x.id===pid);if(!p)return;
+  const parsed=getParsed(pid,p.activeSheet);if(!parsed){notify('No data','err');return;}
+  const fr=getFilteredRows(pid,parsed);
+  const ws=XLSX.utils.aoa_to_sheet([parsed.headers,...fr]);
+  const wb2=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb2,ws,p.activeSheet||'Data');
+  XLSX.writeFile(wb2,`${p.name}.xlsx`);audit('export',`Exported Excel: ${p.name}`);notify('Excel exported ✓','ok');
+}
+function toggleFS(){!document.fullscreenElement?document.documentElement.requestFullscreen?.():document.exitFullscreen?.();}
+
+// ═══ REFRESH ═══
+function manualRefresh(){
+  const a=document.querySelector('.page.active');
+  if(a?.id.startsWith('dp-')){const pid=a.id.replace('dp-','');loadPageData(pid);}else notify('Refreshed','ok');
+}
+function toggleAuto(){clearTimer();if(document.getElementById('autoTgl').checked){S.autoTimer=setInterval(()=>{const a=document.querySelector('.page.active');if(a?.id.startsWith('dp-'))loadPageData(a.id.replace('dp-',''));},60000);notify('Auto ON (1min)','ok');}}
+function clearTimer(){if(S.autoTimer){clearInterval(S.autoTimer);S.autoTimer=null;}}
+
+// ═══ AUDIT ═══
+function renderAudit(){
+  const el=document.getElementById('auditList');if(!el)return;
+  if(!S.auditLog.length){el.innerHTML='<div class="empty">No activity yet</div>';return;}
+  el.innerHTML=S.auditLog.slice(0,80).map(a=>`
+    <div class="arow"><div class="adot ${a.action}"></div>
+      <div><div style="font-size:12px;font-weight:600">${a.detail}</div><div style="font-size:10px;color:var(--muted)">${a.user} · ${a.time}</div></div>
+    </div>`).join('');
+}
+
+// ═══ MODAL HELPERS ═══
+function openModal(id){document.getElementById(id).classList.add('open');}
+function closeModal(id){document.getElementById(id).classList.remove('open');}
+document.addEventListener('click',e=>{
+  const sb=document.getElementById('sidebar');
+  if(sb.classList.contains('mob-open')&&!sb.contains(e.target)&&!e.target.closest('#mobBtn'))sb.classList.remove('mob-open');
+});
+initFirebase();
+</script>
+</body>
+</html>
